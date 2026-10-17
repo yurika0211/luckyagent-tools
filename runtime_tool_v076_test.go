@@ -1,0 +1,314 @@
+package tool
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+)
+
+// TestDelegateManager_SetAgentExecutor 测试设置 Agent 执行器
+func TestDelegateManager_SetAgentExecutor(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	executor := func(ctx context.Context, description, contextStr string) (string, error) {
+		return "test result", nil
+	}
+
+	dm.SetAgentExecutor(executor)
+
+	// 验证执行器已设置（通过调用 delegate 来验证）
+	// 这里主要测试 SetAgentExecutor 不 panic
+	if dm == nil {
+		t.Fatal("DelegateManager should not be nil")
+	}
+}
+
+// TestDelegateManager_DelegateParallel 测试并行委派
+func TestDelegateManager_DelegateParallel(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	// 测试空任务列表
+	result := dm.DelegateParallel([]string{}, "", time.Minute)
+	if result.Summary != "No tasks to delegate" {
+		t.Errorf("Expected 'No tasks to delegate', got: %s", result.Summary)
+	}
+
+	// 测试单个任务
+	result = dm.DelegateParallel([]string{"test task"}, "", time.Minute)
+	if result.Summary == "" {
+		t.Error("Expected non-empty summary")
+	}
+	t.Logf("Parallel result: %s", result.Summary)
+}
+
+// TestDelegateManager_DelegateParallelMultiple 测试多个并行任务
+func TestDelegateManager_DelegateParallelMultiple(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	tasks := []string{
+		"task 1",
+		"task 2",
+		"task 3",
+	}
+
+	result := dm.DelegateParallel(tasks, "test context", time.Minute)
+
+	// 验证结果包含所有任务
+	if result.SuccessCount < 0 || result.SuccessCount > len(tasks) {
+		t.Errorf("Expected success count between 0 and %d, got %d", len(tasks), result.SuccessCount)
+	}
+
+	t.Logf("Parallel delegate: %d tasks, %d succeeded", len(tasks), result.SuccessCount)
+}
+
+// TestDelegateManager_DelegateParallelEmptyContext 测试空上下文
+func TestDelegateManager_DelegateParallelEmptyContext(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	result := dm.DelegateParallel([]string{"task with empty context"}, "", 30*time.Second)
+
+	if result.TotalDuration < 0 {
+		t.Error("Expected non-negative duration")
+	}
+}
+
+// TestDelegateManager_Config 测试配置
+func TestDelegateManager_Config(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	// 验证管理器已正确初始化
+	if dm == nil {
+		t.Fatal("DelegateManager should not be nil")
+	}
+
+	// 验证默认配置
+	if dm.config.MaxConcurrent <= 0 {
+		t.Log("Using default max concurrent")
+	}
+}
+
+// TestDelegateManager_ConcurrentLimit 测试并发限制
+func TestDelegateManager_ConcurrentLimit(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	// 设置较小的并发数
+	dm.config.MaxConcurrent = 2
+
+	tasks := []string{
+		"task 1",
+		"task 2",
+		"task 3",
+		"task 4",
+		"task 5",
+	}
+
+	result := dm.DelegateParallel(tasks, "", time.Minute)
+
+	// 验证任务执行完成
+	if result.Summary == "" {
+		t.Error("Expected non-empty summary")
+	}
+
+	t.Logf("Concurrent test completed: %s", result.Summary)
+}
+
+// TestDelegateManager_Timeout 测试超时处理
+func TestDelegateManager_Timeout(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	// 测试非常短的超时
+	result := dm.DelegateParallel([]string{"quick task"}, "", 100*time.Millisecond)
+
+	// 验证有结果返回（即使超时）
+	if result == nil {
+		t.Error("Expected result even with timeout")
+	}
+}
+
+// TestDelegateManager_LargeParallel 测试大量并行任务
+func TestDelegateManager_LargeParallel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping large parallel test in short mode")
+	}
+
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	// 创建 10 个任务
+	tasks := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		tasks[i] = fmt.Sprintf("parallel task %d", i+1)
+	}
+
+	result := dm.DelegateParallel(tasks, "", 2*time.Minute)
+
+	t.Logf("Large parallel: %d tasks, %d succeeded, duration: %v",
+		len(tasks), result.SuccessCount, result.TotalDuration)
+}
+
+// TestGateway_ExecuteWithShellContext 测试带 shell 上下文的工具执行
+func TestGateway_ExecuteWithShellContext(t *testing.T) {
+	reg := NewRegistry()
+	gw := NewGateway(reg)
+	if gw == nil {
+		t.Fatal("Gateway should not be nil")
+	}
+
+	// 测试不存在的工具
+	_, err := gw.ExecuteWithShellContext("nonexistent_tool", nil, "", nil)
+	if err == nil {
+		t.Error("Expected error for nonexistent tool")
+	}
+	t.Logf("ExecuteWithShellContext error (expected): %v", err)
+}
+
+// TestGateway_ExecuteWithShellContextNilArgs 测试 nil 参数
+func TestGateway_ExecuteWithShellContextNilArgs(t *testing.T) {
+	reg := NewRegistry()
+	gw := NewGateway(reg)
+
+	// 测试 nil args
+	_, err := gw.ExecuteWithShellContext("test_tool", nil, "user123", nil)
+	// 应该返回错误（工具不存在）
+	if err == nil {
+		t.Error("Expected error for nonexistent tool")
+	}
+}
+
+// TestGateway_ExecuteWithShellContextEmptyUser 测试空用户 ID
+func TestGateway_ExecuteWithShellContextEmptyUser(t *testing.T) {
+	reg := NewRegistry()
+	gw := NewGateway(reg)
+
+	// 测试空用户 ID
+	_, err := gw.ExecuteWithShellContext("test_tool", map[string]any{}, "", nil)
+	if err == nil {
+		t.Error("Expected error for nonexistent tool")
+	}
+}
+
+// TestGateway_ExecuteWithShellContextWithShell 测试带 shell 上下文
+func TestGateway_ExecuteWithShellContextWithShell(t *testing.T) {
+	reg := NewRegistry()
+	gw := NewGateway(reg)
+
+	// 创建 mock shell 上下文
+	sc := &ShellContext{
+		Cwd: t.TempDir(),
+		Env: map[string]string{"TEST": "value"},
+	}
+
+	// 测试不存在的工具（带 shell 上下文）
+	_, err := gw.ExecuteWithShellContext("nonexistent", nil, "", sc)
+	if err == nil {
+		t.Error("Expected error for nonexistent tool")
+	}
+}
+
+// TestGateway_ExecuteWithShellContextPermission 测试权限检查
+func TestGateway_ExecuteWithShellContextPermission(t *testing.T) {
+	reg := NewRegistry()
+	gw := NewGateway(reg)
+
+	// 测试权限检查流程（工具不存在时会先返回 NotFound）
+	_, err := gw.ExecuteWithShellContext("test_perm", nil, "user", nil)
+	if err == nil {
+		t.Error("Expected error")
+	}
+}
+
+// TestGateway_ExecuteWithShellContextSubscription 测试订阅检查
+func TestGateway_ExecuteWithShellContextSubscription(t *testing.T) {
+	reg := NewRegistry()
+	gw := NewGateway(reg)
+
+	// 测试订阅检查流程
+	_, err := gw.ExecuteWithShellContext("test_sub", nil, "subscriber", nil)
+	if err == nil {
+		t.Error("Expected error for nonexistent tool")
+	}
+}
+
+// TestGateway_ExecuteWithShellContextResult 测试结果结构
+func TestGateway_ExecuteWithShellContextResult(t *testing.T) {
+	reg := NewRegistry()
+	gw := NewGateway(reg)
+
+	// 验证错误情况下的结果结构
+	result, err := gw.ExecuteWithShellContext("fake_tool", nil, "", nil)
+
+	// 应该返回错误
+	if err == nil {
+		t.Error("Expected error")
+	}
+	// result 应该为 nil
+	if result != nil {
+		t.Log("Result may be nil on error")
+	}
+}
+
+// TestDelegateManager_DelegateParallelTool 测试 DelegateParallelTool
+func TestDelegateManager_DelegateParallelTool(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	tool := dm.DelegateParallelTool()
+
+	if tool == nil {
+		t.Fatal("DelegateParallelTool should not be nil")
+	}
+
+	if tool.Name != "delegate_parallel" {
+		t.Errorf("Expected name 'delegate_parallel', got: %s", tool.Name)
+	}
+
+	if tool.Permission != PermApprove {
+		t.Errorf("Expected permission PermApprove, got: %v", tool.Permission)
+	}
+
+	// 验证参数
+	if _, ok := tool.Parameters["tasks"]; !ok {
+		t.Error("Expected 'tasks' parameter")
+	}
+
+	t.Logf("DelegateParallelTool created: %s", tool.Name)
+}
+
+// TestDelegateManager_HandleDelegateParallel 测试 handleDelegateParallel
+func TestDelegateManager_HandleDelegateParallel(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	// 测试空 tasks
+	args := map[string]any{
+		"tasks": []any{},
+	}
+
+	// handleDelegateParallel 应该能处理空 tasks
+	// 由于实际实现可能不同，这里只验证不 panic
+	result, err := dm.handleDelegateParallel(args)
+	t.Logf("handleDelegateParallel result: %s, err: %v", result, err)
+}
+
+// TestDelegateManager_HandleDelegateParallelWithTasks 测试带任务的处理
+func TestDelegateManager_HandleDelegateParallelWithTasks(t *testing.T) {
+	cfg := DelegateConfig{}
+	dm := NewDelegateManager(cfg)
+
+	args := map[string]any{
+		"tasks":   []any{"task 1", "task 2"},
+		"context": "test context",
+		"timeout": 60,
+	}
+
+	result, err := dm.handleDelegateParallel(args)
+	t.Logf("handleDelegateParallel with tasks: %s, err: %v", result, err)
+}

@@ -1,0 +1,100 @@
+package tool
+
+import (
+	"sync"
+
+	"github.com/yurika0211/luckyagent-tools/multimodal"
+)
+
+// BuiltinToolService wraps the generic builtin tool registrations.
+type BuiltinToolService struct {
+	mu                   sync.RWMutex
+	searchCfg            *WebSearchConfig
+	opencliCfg           *OpenCLIConfig
+	mediaProcessor       *multimodal.Processor
+	imageGenerator       multimodal.ImageGenerator
+	imageGenDefaults     ImageGenerationDefaults
+	speechSynthesizer    multimodal.SpeechSynthesizer
+	ttsDefaults          TTSDefaults
+	defaultImageProvider string
+	filesystemPolicy     FilesystemPolicy
+	computerUse          *ComputerUseToolService
+}
+
+// NewBuiltinToolService creates a builtin tool service.
+func NewBuiltinToolService(searchCfg *WebSearchConfig, opencliCfg *OpenCLIConfig, defaultImageProvider string, mediaProcessor *multimodal.Processor, imageGenerator multimodal.ImageGenerator, imageGenDefaults ImageGenerationDefaults, speechSynthesizer multimodal.SpeechSynthesizer, ttsDefaults TTSDefaults, policies ...FilesystemPolicy) *BuiltinToolService {
+	policy := filesystemPolicyFromOptional(policies)
+	return &BuiltinToolService{
+		searchCfg:            searchCfg,
+		opencliCfg:           opencliCfg,
+		mediaProcessor:       mediaProcessor,
+		imageGenerator:       imageGenerator,
+		imageGenDefaults:     imageGenDefaults,
+		speechSynthesizer:    speechSynthesizer,
+		ttsDefaults:          ttsDefaults,
+		defaultImageProvider: defaultImageProvider,
+		filesystemPolicy:     policy,
+	}
+}
+
+// RegisterTools registers builtin terminal/file/web/time tools.
+func (s *BuiltinToolService) RegisterTools(r *Registry) {
+	if s == nil || r == nil {
+		return
+	}
+	r.Register(TerminalTool())
+	r.Register(AskUserTool())
+	r.Register(RequestCredentialTool())
+	r.Register(FileReadTool(s.filesystemPolicy))
+	r.Register(DocumentReadTool(s.filesystemPolicy))
+	r.Register(FileWriteTool())
+	r.Register(FileMkdirTool())
+	r.Register(FileMoveTool())
+	r.Register(FileDeleteTool())
+	r.Register(FilePatchTool())
+	r.Register(FileListTool(s.filesystemPolicy))
+	r.Register(WebSearchTool(s.searchCfg))
+	r.Register(WebFetchTool(s.searchCfg))
+	r.Register(OpenCLITool(s.opencliCfg, s.searchCfg))
+	r.Register(CurrentTimeTool())
+	r.Register(CalculateTool())
+	r.Register(ImageTool(s.mediaProcessor, s.defaultImageProvider, s.imageGenerator, s.imageGenDefaults))
+	r.Register(TextToSpeechTool(s.speechSynthesizer, s.ttsDefaults))
+	r.Register(DataTool())
+	r.Register(HTTPRequestTool())
+	if s.computerUse != nil {
+		s.computerUse.RegisterTools(r)
+	}
+}
+
+// SetComputerUseService attaches the optional desktop automation tools.
+func (s *BuiltinToolService) SetComputerUseService(service *ComputerUseToolService) {
+	if s != nil {
+		s.computerUse = service
+	}
+}
+
+// ReloadMedia replaces only media-dependent tool implementations. Existing
+// invocations retain their captured provider while new tool calls use the
+// updated model configuration.
+func (s *BuiltinToolService) ReloadMedia(r *Registry, defaultImageProvider string, mediaProcessor *multimodal.Processor, imageGenerator multimodal.ImageGenerator, imageGenDefaults ImageGenerationDefaults, speechSynthesizer multimodal.SpeechSynthesizer, ttsDefaults TTSDefaults) {
+	if s == nil || r == nil {
+		return
+	}
+	s.mu.Lock()
+	s.defaultImageProvider = defaultImageProvider
+	s.mediaProcessor = mediaProcessor
+	s.imageGenerator = imageGenerator
+	s.imageGenDefaults = imageGenDefaults
+	s.speechSynthesizer = speechSynthesizer
+	s.ttsDefaults = ttsDefaults
+	processor := s.mediaProcessor
+	providerName := s.defaultImageProvider
+	generator := s.imageGenerator
+	imageDefaults := s.imageGenDefaults
+	synthesizer := s.speechSynthesizer
+	speechDefaults := s.ttsDefaults
+	s.mu.Unlock()
+	r.Register(ImageTool(processor, providerName, generator, imageDefaults))
+	r.Register(TextToSpeechTool(synthesizer, speechDefaults))
+}

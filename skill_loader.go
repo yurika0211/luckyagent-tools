@@ -1,0 +1,800 @@
+package tool
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	// defaultCLIInspectTimeout bounds a single `<script> --help` probe. Nothing
+	// legitimate comes close; the ceiling exists so one wedged skill cannot hang
+	// agent startup forever.
+	defaultCLIInspectTimeout = 15 * time.Second
+	// cliInspectKillGrace mirrors internal/hook/external.go: after the context
+	// deadline, give the process this long to die before abandoning its pipes.
+	cliInspectKillGrace = 500 * time.Millisecond
+)
+
+// SkillLoader 从 SKILL.md 文件加载工具定义
+type SkillLoader struct {
+	skillsDir string // skills 目录路径
+
+	// cliInspect controls the `--help` probe used to derive subcommand tools.
+	// The probe *executes* the skill's script, so any pipeline that loads
+	// untrusted skills must turn it off until the content has been vetted.
+	cliInspect     bool
+	inspectTimeout time.Duration // <=0 uses defaultCLIInspectTimeout
+	probeEnv       []string      // nil inherits the parent environment
+}
+
+// NewSkillLoader 创建 Skill 加载器
+func NewSkillLoader(skillsDir string) *SkillLoader {
+	return &SkillLoader{skillsDir: skillsDir, cliInspect: true}
+}
+
+// WithCLIInspect toggles the `--help` probe and sets its per-invocation timeout.
+// Pass enabled=false for a parse-only load that executes nothing.
+func (sl *SkillLoader) WithCLIInspect(enabled bool, timeout time.Duration) *SkillLoader {
+	if sl == nil {
+		return nil
+	}
+	sl.cliInspect = enabled
+	sl.inspectTimeout = timeout
+	return sl
+}
+
+// WithProbeEnv replaces the environment handed to the `--help` probe. Use it to
+// keep credentials in the parent environment out of reach of skill code that has
+// not been reviewed yet.
+func (sl *SkillLoader) WithProbeEnv(env []string) *SkillLoader {
+	if sl == nil {
+		return nil
+	}
+	sl.probeEnv = env
+	return sl
+}
+
+// SkillInfo Skill 元信息
+type SkillInfo struct {
+	Name        string
+	Aliases     []string
+	Description string
+	Summary     string // v0.36.0: SKILL.md 精简摘要，用于注入 system prompt
+	Dir         string
+	Tools       []SkillToolDef
+	Available   bool
+}
+
+// SkillToolDef Skill 中定义的工具
+type SkillToolDef struct {
+	Name          string
+	Description   string
+	Parameters    map[string]Param
+	Handler       func(args map[string]any) (string, error) // 需要外部注入
+	Command       []string
+	ExposeToModel bool
+}
+
+// LoadAll 加载所有 Skill
+func (sl *SkillLoader) LoadAll() ([]*SkillInfo, error) {
+	entries, err := os.ReadDir(sl.skillsDir)
+	if err != nil {
+		return nil, fmt.Errorf("read skills dir: %w", err)
+	}
+
+	var skills []*SkillInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		skillDir := filepath.Join(sl.skillsDir, entry.Name())
+		skillFile := filepath.Join(skillDir, "SKILL.md")
+
+		info, err := sl.Load(skillFile)
+		if err != nil {
+			continue // 跳过无法加载的
+		}
+		skills = append(skills, info)
+	}
+
+	return skills, nil
+}
+
+// Load 加载单个 SKILL.md
+func (sl *SkillLoader) Load(path string) (*SkillInfo, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read skill: %w", err)
+	}
+
+	content := string(data)
+	info := &SkillInfo{
+		Available: true,
+	}
+
+	// 解析 Skill 名称（从目录名）
+	dir := filepath.Dir(path)
+	info.Dir = dir
+	dirName := filepath.Base(dir)
+	info.Name = sanitizeName(dirName)
+	addSkillAlias(info, dirName)
+
+	// v0.35.0: 解析 frontmatter
+	fm := parseFrontmatter(content)
+	hasFrontmatterName := false
+	if name, ok := fm["name"]; ok && name != "" {
+		info.Name = sanitizeName(name)
+		hasFrontmatterName = true
+		addSkillAlias(info, name)
+	}
+	if desc, ok := fm["description"]; ok && desc != "" {
+		info.Description = desc
+	}
+
+	// 解析标题（第一个 # 标题）— 仅作 fallback name
+	if match := regexp.MustCompile(`(?m)^#\s+(.+)$`).FindStringSubmatch(content); len(match) > 1 {
+		titleName := strings.TrimSpace(match[1])
+		// 去掉标题中的 emoji 和特殊字符
+		addSkillAlias(info, titleName)
+		titleName = sanitizeName(titleName)
+		if !hasFrontmatterName && (info.Name == "" || info.Name == sanitizeName(dirName)) {
+			info.Name = titleName
+		}
+	}
+
+	// 解析描述（标题后的第一段非空文本）— 仅作 fallback
+	if info.Description == "" {
+		info.Description = sl.extractDescription(content)
+	}
+
+	// 解析工具定义
+	info.Tools = sl.parseToolDefs(content)
+
+	// v0.35.0: 如果没有显式工具定义，自动生成一个通用工具
+	if len(info.Tools) == 0 {
+		info.Tools = sl.autoGenerateTools(info, content)
+	}
+
+	// v0.36.0: 提取 SKILL.md 精简摘要
+	info.Summary = sl.extractSummary(content)
+
+	return info, nil
+}
+
+func addSkillAlias(info *SkillInfo, alias string) {
+	alias = sanitizeName(alias)
+	if alias == "" {
+		return
+	}
+	if alias == info.Name {
+		return
+	}
+	for _, existing := range info.Aliases {
+		if existing == alias {
+			return
+		}
+	}
+	info.Aliases = append(info.Aliases, alias)
+}
+
+// extractDescription 从 SKILL.md 提取描述
+func (sl *SkillLoader) extractDescription(content string) string {
+	// 去掉 frontmatter
+	body := stripFrontmatter(content)
+
+	lines := strings.Split(body, "\n")
+	inHeader := true
+	for _, line := range lines {
+		if inHeader {
+			if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
+				continue
+			}
+			inHeader = false
+		}
+		if strings.TrimSpace(line) != "" {
+			desc := strings.TrimSpace(line)
+			// 截断过长的描述
+			if len(desc) > 200 {
+				desc = desc[:197] + "..."
+			}
+			return desc
+		}
+	}
+	return ""
+}
+
+// autoGenerateTools 为没有显式工具定义的 skill 自动生成工具
+func (sl *SkillLoader) autoGenerateTools(info *SkillInfo, content string) []SkillToolDef {
+	var tools []SkillToolDef
+
+	// 检查 scripts/ 目录下有哪些脚本
+	scriptsDir := filepath.Join(info.Dir, "scripts")
+	scripts := sl.findScripts(scriptsDir)
+
+	if len(scripts) == 0 {
+		// 纯文档型 skill 通过 skill_read 暴露，避免模型把静态指南当成可执行工具反复调用。
+		return nil
+	}
+
+	if len(scripts) == 1 {
+		scriptPath := filepath.Join(scriptsDir, scripts[0].Name())
+		if cliTools := sl.discoverCLITools(scriptPath); len(cliTools) > 0 {
+			mainTool := SkillToolDef{
+				Name:          "run",
+				Description:   fmt.Sprintf("Primary entry for the %s skill. Use when the task matches this workflow and you want the skill to guide the execution path.", info.Name),
+				ExposeToModel: true,
+				Parameters: map[string]Param{
+					"query": {
+						Type:        "string",
+						Description: "Concrete user task or goal that should be handled through this skill workflow.",
+						Required:    false,
+					},
+				},
+			}
+			return append([]SkillToolDef{mainTool}, cliTools...)
+		}
+	}
+
+	// 为每个脚本生成一个工具
+	for _, script := range scripts {
+		toolName := strings.TrimSuffix(script.Name(), filepath.Ext(script.Name()))
+		toolName = sanitizeName(toolName)
+		if toolName == "" {
+			continue
+		}
+		tools = append(tools, SkillToolDef{
+			Name:          toolName,
+			Description:   fmt.Sprintf("Use the %s workflow through its %s script when this skill clearly matches the task and direct execution would be less reliable.", info.Name, toolName),
+			Parameters:    map[string]Param{},
+			ExposeToModel: false,
+		})
+	}
+
+	// 始终生成一个主工具（skill name 本身）
+	// 即使有脚本工具，也保留一个入口
+	mainTool := SkillToolDef{
+		Name:          "run",
+		Description:   fmt.Sprintf("Primary entry for the %s skill. Use when the task matches this workflow and you want the skill to guide the execution path.", info.Name),
+		ExposeToModel: true,
+		Parameters: map[string]Param{
+			"query": {
+				Type:        "string",
+				Description: "Concrete user task or goal that should be handled through this skill workflow.",
+				Required:    false,
+			},
+		},
+	}
+	tools = append([]SkillToolDef{mainTool}, tools...)
+
+	return tools
+}
+
+func (sl *SkillLoader) discoverCLITools(scriptPath string) []SkillToolDef {
+	// The probe executes scriptPath. Callers loading unvetted content disable it.
+	if sl == nil || !sl.cliInspect {
+		return nil
+	}
+	top, err := sl.inspectCLICommands(scriptPath, nil)
+	if err != nil || len(top) == 0 {
+		return nil
+	}
+
+	var tools []SkillToolDef
+	for _, cmd := range top {
+		children, _ := sl.inspectCLICommands(scriptPath, []string{cmd.Name})
+		if len(children) == 0 {
+			tools = append(tools, cliCommandToToolDef([]string{cmd.Name}, cmd.Description))
+			continue
+		}
+		for _, child := range children {
+			tools = append(tools, cliCommandToToolDef([]string{cmd.Name, child.Name}, child.Description))
+		}
+	}
+	sort.Slice(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
+	return tools
+}
+
+type cliCommandInfo struct {
+	Name        string
+	Description string
+}
+
+func (sl *SkillLoader) inspectCLICommands(scriptPath string, prefix []string) ([]cliCommandInfo, error) {
+	baseCmd, err := buildSkillScriptCommand(scriptPath, prefix...)
+	if err != nil {
+		return nil, err
+	}
+	baseCmd = append(baseCmd, "--help")
+
+	timeout := defaultCLIInspectTimeout
+	if sl != nil && sl.inspectTimeout > 0 {
+		timeout = sl.inspectTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, baseCmd[0], baseCmd[1:]...)
+	// Without WaitDelay, a --help that forks a child holding the stdout pipe keeps
+	// CombinedOutput blocked well past the deadline — killing the direct child is
+	// not enough. Same reasoning as internal/hook/external.go.
+	cmd.WaitDelay = cliInspectKillGrace
+	// Never let a probe block on stdin.
+	cmd.Stdin = nil
+	if sl != nil && sl.probeEnv != nil {
+		cmd.Env = sl.probeEnv
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return nil, err
+	}
+	return parseCLIHelpCommands(string(out)), nil
+}
+
+func parseCLIHelpCommands(help string) []cliCommandInfo {
+	lines := strings.Split(help, "\n")
+	entryRe := regexp.MustCompile(`^\s{2,}([a-zA-Z0-9][a-zA-Z0-9_-]*)\s{2,}(.+)$`)
+	var cmds []cliCommandInfo
+	inPositional := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch trimmed {
+		case "positional arguments:":
+			inPositional = true
+			continue
+		case "options:", "optional arguments:":
+			inPositional = false
+		}
+		if !inPositional {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+			continue
+		}
+		m := entryRe.FindStringSubmatch(line)
+		if len(m) != 3 {
+			continue
+		}
+		name := strings.TrimSpace(m[1])
+		if name == "-h" || name == "--help" {
+			continue
+		}
+		cmds = append(cmds, cliCommandInfo{
+			Name:        sanitizeName(name),
+			Description: strings.TrimSpace(m[2]),
+		})
+	}
+	return cmds
+}
+
+func cliCommandToToolDef(command []string, description string) SkillToolDef {
+	name := sanitizeName(strings.Join(command, "_"))
+	if name == "" {
+		name = "run"
+	}
+	desc := strings.TrimSpace(description)
+	if desc == "" {
+		desc = fmt.Sprintf("Run CLI subcommand: %s", strings.Join(command, " "))
+	}
+	return SkillToolDef{
+		Name:          name,
+		Description:   desc + " Pass CLI flags and arguments through the args parameter, for example: --username admin --password ***",
+		Command:       append([]string(nil), command...),
+		ExposeToModel: true,
+		Parameters: map[string]Param{
+			"args": {
+				Type:        "string",
+				Description: "Additional CLI flags and arguments to append after the subcommand.",
+				Required:    false,
+			},
+		},
+	}
+}
+
+// findScripts 查找 scripts 目录下的可执行脚本
+func (sl *SkillLoader) findScripts(dir string) []os.DirEntry {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+
+	var scripts []os.DirEntry
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// 支持的脚本类型
+		if strings.HasSuffix(name, ".sh") || strings.HasSuffix(name, ".py") ||
+			strings.HasSuffix(name, ".js") || strings.HasSuffix(name, ".go") {
+			scripts = append(scripts, entry)
+		}
+	}
+	return scripts
+}
+
+// parseToolDefs 从 SKILL.md 内容解析工具定义
+func (sl *SkillLoader) parseToolDefs(content string) []SkillToolDef {
+	var tools []SkillToolDef
+
+	// 查找工具区域
+	toolSection := sl.extractSection(content, "Tools")
+	if toolSection == "" {
+		toolSection = sl.extractSection(content, "可用工具")
+	}
+	if toolSection == "" {
+		toolSection = sl.extractSection(content, "工具")
+	}
+
+	if toolSection == "" {
+		return tools
+	}
+
+	// 解析工具条目
+	// 格式: - `tool_name`: description
+	// 或: - **tool_name**: description
+	scanner := bufio.NewScanner(strings.NewReader(toolSection))
+	for scanner.Scan() {
+		line := scanner.Text()
+		line = strings.TrimSpace(line)
+
+		// 匹配列表项
+		if !strings.HasPrefix(line, "-") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "-")
+		line = strings.TrimSpace(line)
+
+		name, desc := parseToolEntry(line)
+		if name == "" {
+			continue
+		}
+
+		tools = append(tools, SkillToolDef{
+			Name:        name,
+			Description: desc,
+			Parameters:  map[string]Param{},
+		})
+	}
+
+	return tools
+}
+
+// extractSection 提取 Markdown section
+func (sl *SkillLoader) extractSection(content, title string) string {
+	// 查找 ## title
+	sectionStart := -1
+	sectionEnd := -1
+
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "## ") {
+			heading := strings.TrimPrefix(line, "## ")
+			heading = strings.TrimSpace(heading)
+			if strings.EqualFold(heading, title) {
+				sectionStart = i + 1
+				continue
+			}
+			// 遇到下一个 ## 结束
+			if sectionStart >= 0 && sectionEnd < 0 {
+				sectionEnd = i
+			}
+		}
+	}
+
+	if sectionStart < 0 {
+		return ""
+	}
+	if sectionEnd < 0 {
+		sectionEnd = len(lines)
+	}
+
+	return strings.Join(lines[sectionStart:sectionEnd], "\n")
+}
+
+// parseToolEntry 解析工具条目
+func parseToolEntry(line string) (name, desc string) {
+	// 格式1: `tool_name`: description
+	re1 := regexp.MustCompile("`([^`]+)`\\s*[:：]\\s*(.+)")
+	if match := re1.FindStringSubmatch(line); len(match) > 2 {
+		return match[1], match[2]
+	}
+
+	// 格式2: **tool_name**: description
+	re2 := regexp.MustCompile(`\*\*([^*]+)\*\*\s*[:：]\s*(.+)`)
+	if match := re2.FindStringSubmatch(line); len(match) > 2 {
+		return match[1], match[2]
+	}
+
+	// 格式3: tool_name - description
+	re3 := regexp.MustCompile(`^(\w[\w_-]*)\s*[-—–]\s*(.+)`)
+	if match := re3.FindStringSubmatch(line); len(match) > 2 {
+		return match[1], match[2]
+	}
+
+	return "", ""
+}
+
+// parseFrontmatter 解析 YAML frontmatter
+func parseFrontmatter(content string) map[string]string {
+	result := make(map[string]string)
+
+	// 检查是否以 --- 开头
+	if !strings.HasPrefix(content, "---") {
+		return result
+	}
+
+	// 找到结束的 ---
+	end := strings.Index(content[3:], "---")
+	if end < 0 {
+		return result
+	}
+
+	fm := content[3 : end+3]
+	scanner := bufio.NewScanner(strings.NewReader(fm))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// 简单 key: value 解析（不处理嵌套 YAML）
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			// 去掉引号
+			val = strings.Trim(val, "\"'")
+			if key != "" && val != "" {
+				result[key] = val
+			}
+		}
+	}
+
+	return result
+}
+
+// stripFrontmatter 去掉 frontmatter，返回 body
+func stripFrontmatter(content string) string {
+	if !strings.HasPrefix(content, "---") {
+		return content
+	}
+	end := strings.Index(content[3:], "---")
+	if end < 0 {
+		return content
+	}
+	return strings.TrimSpace(content[end+6:])
+}
+
+// sanitizeName 清理名称，去掉特殊字符
+func sanitizeName(name string) string {
+	// 去掉 emoji（保留其他所有字符）
+	re := regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F1E0}-\x{1F1FF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}]`)
+	name = re.ReplaceAllString(name, "")
+
+	// 去掉首尾空白
+	name = strings.TrimSpace(name)
+
+	// 转小写
+	name = strings.ToLower(name)
+
+	// 将空白字符和连续特殊字符替换为单个下划线
+	name = regexp.MustCompile(`\s+`).ReplaceAllString(name, "_")
+	// 保留中文、字母、数字、下划线、连字符，其他都替换为下划线
+	name = regexp.MustCompile(`[^a-zA-Z0-9_\x{4e00}-\x{9fff}-]`).ReplaceAllString(name, "_")
+
+	// 去掉首尾的下划线和连字符
+	name = strings.Trim(name, "_-")
+
+	return name
+}
+
+// RegisterSkillTools 将 Skill 工具注册到 Registry
+// handler 为 Skill 工具的通用处理器（通常调用脚本或子进程）
+func RegisterSkillTools(r *Registry, skills []*SkillInfo, handler func(toolName string, skillDir string) func(args map[string]any) (string, error)) {
+	executor := NewSkillExecutor()
+	for _, skill := range skills {
+		if skill == nil {
+			continue
+		}
+		for _, toolDef := range skill.Tools {
+			var toolHandler func(args map[string]any) (string, error)
+			if handler != nil {
+				toolHandler = handler(toolDef.Name, skill.Dir)
+			} else {
+				toolHandler, _ = executor.HandlerFor(skill, toolDef)
+			}
+			r.Register(newSkillToolFromDef(skill, toolDef, toolHandler))
+		}
+	}
+}
+
+// defaultSkillHandler 为 skill 工具提供默认执行逻辑
+func defaultSkillHandler(toolDef SkillToolDef, skillDir, skillName string) func(args map[string]any) (string, error) {
+	return func(args map[string]any) (string, error) {
+		toolName := toolDef.Name
+		// 1. 尝试执行 scripts/<toolName>.sh 或 .py
+		for _, ext := range []string{".sh", ".py", ".js"} {
+			scriptPath := filepath.Join(skillDir, "scripts", toolName+ext)
+			if _, err := os.Stat(scriptPath); err == nil {
+				return executeScript(scriptPath, args)
+			}
+		}
+
+		// 2. 尝试执行 scripts/ 目录下唯一的脚本
+		scriptsDir := filepath.Join(skillDir, "scripts")
+		if entries, err := os.ReadDir(scriptsDir); err == nil && len(entries) == 1 {
+			if !entries[0].IsDir() {
+				scriptPath := filepath.Join(scriptsDir, entries[0].Name())
+				if len(toolDef.Command) > 0 {
+					return executeScriptWithCommand(scriptPath, toolDef.Command, args)
+				}
+				return executeScript(scriptPath, args)
+			}
+		}
+
+		// 3. 返回 SKILL.md 内容摘要
+		skillFile := filepath.Join(skillDir, "SKILL.md")
+		if data, err := os.ReadFile(skillFile); err == nil {
+			content := string(data)
+			// 去掉 frontmatter
+			body := stripFrontmatter(content)
+			// 截取前 500 字符作为摘要
+			if len(body) > 500 {
+				body = body[:497] + "..."
+			}
+			return fmt.Sprintf("[Skill: %s / Tool: %s]\n%s", skillName, toolName, body), nil
+		}
+
+		return fmt.Sprintf("Skill '%s' tool '%s' — no executable script found and SKILL.md unreadable", skillName, toolName), nil
+	}
+}
+
+// executeScript 执行脚本并返回输出
+func executeScript(scriptPath string, args map[string]any) (string, error) {
+	baseCmd, err := buildSkillScriptCommand(scriptPath)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command(baseCmd[0], baseCmd[1:]...)
+
+	// 将 args 序列化为环境变量
+	for k, v := range args {
+		cmd.Env = append(cmd.Environ(), fmt.Sprintf("SKILL_ARG_%s=%v", strings.ToUpper(k), v))
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("script error: %w", err)
+	}
+	return string(output), nil
+}
+
+func executeScriptWithCommand(scriptPath string, commandParts []string, args map[string]any) (string, error) {
+	baseCmd, err := buildSkillScriptCommand(scriptPath, commandParts...)
+	if err != nil {
+		return "", err
+	}
+	if rawArgs, ok := args["args"].(string); ok && strings.TrimSpace(rawArgs) != "" {
+		baseCmd = append(baseCmd, strings.Fields(rawArgs)...)
+	}
+	cmd := exec.Command(baseCmd[0], baseCmd[1:]...)
+	for k, v := range args {
+		cmd.Env = append(cmd.Environ(), fmt.Sprintf("SKILL_ARG_%s=%v", strings.ToUpper(k), v))
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("script error: %w", err)
+	}
+	return string(output), nil
+}
+
+func buildSkillScriptCommand(scriptPath string, args ...string) ([]string, error) {
+	return buildScriptCommand(scriptPath, args...)
+}
+
+// extractSummary 从 SKILL.md 提取精简摘要，用于注入 system prompt
+// 策略：提取关键 section（Trigger/When to use/Steps/Tools）的要点，限制总长 500 字符
+func (sl *SkillLoader) extractSummary(content string) string {
+	body := stripFrontmatter(content)
+	lines := strings.Split(body, "\n")
+
+	var summary strings.Builder
+	var inTargetSection bool
+
+	// 目标 section 关键词（大小写不敏感，中英文）
+	targetSections := []string{
+		// English
+		"trigger", "when to use", "when to apply", "steps", "how to use",
+		"usage", "tools", "workflow", "overview", "description",
+		"quick start", "key concepts", "core tools", "how to search",
+		"routing rules", "how it works", "rule of thumb",
+		"command reference", "common patterns", "best practices",
+		"quick decision", "conflict resolution",
+		// Chinese
+		"触发", "工作流", "工作流程", "核心规则", "核心能力",
+		"使用方式", "子技能路由", "覆盖范围", "执行规则",
+		"快速原则", "服务地图", "可用机制", "触发方式",
+		"聊天交付", "商业模式", "战略分析", "参考文档",
+		"核心概念", "工作原理", "认证", "环境变量",
+		"默认策略", "工作规则", "命令", "常见自动化",
+		"设计自动化", "首次使用", "固定配置",
+		"搜索源", "搜索策略", "内容提取", "快速参考",
+		"执行步骤", "快速开始", "技术规范", "页面类型",
+		"输出规范", "身份", "核心人格", "说话风格",
+		"禁忌", "对话模式", "前置依赖", "功能说明",
+		"参数表", "协议", "角色",
+	}
+
+	for _, line := range lines {
+		// 检测 section 标题
+		if strings.HasPrefix(line, "## ") {
+			heading := strings.ToLower(strings.TrimPrefix(line, "## "))
+			inTargetSection = false
+			for _, ts := range targetSections {
+				if strings.Contains(heading, ts) {
+					inTargetSection = true
+					summary.WriteString("[" + strings.TrimPrefix(line, "## ") + "] ")
+					break
+				}
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, "### ") {
+			// 子标题，如果在目标 section 内则保留
+			if inTargetSection {
+				summary.WriteString(strings.TrimPrefix(line, "### ") + ": ")
+			}
+			continue
+		}
+
+		if !inTargetSection {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		// 列表项直接保留
+		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "1.") || strings.HasPrefix(trimmed, "2.") {
+			summary.WriteString(trimmed + " ")
+		} else if len(trimmed) > 0 {
+			// 普通文本截断
+			if len(trimmed) > 80 {
+				trimmed = trimmed[:77] + "..."
+			}
+			summary.WriteString(trimmed + " ")
+		}
+
+		// 限制总长
+		if summary.Len() > 500 {
+			break
+		}
+	}
+
+	result := strings.TrimSpace(summary.String())
+	if len(result) > 500 {
+		result = result[:497] + "..."
+	}
+
+	// 如果没提取到任何内容，用 description 兜底
+	if result == "" {
+		return ""
+	}
+
+	return result
+}

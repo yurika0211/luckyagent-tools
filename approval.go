@@ -2,32 +2,13 @@ package tool
 
 import (
 	"strings"
-	"time"
+
+	"github.com/yurika0211/luckyagent-tools/approval"
 )
 
-// ApprovalOption is the client-facing choice for a pending external-agent
-// permission request. ID is the exact value accepted by the provider bridge.
-type ApprovalOption struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-	Kind  string `json:"kind,omitempty"`
-}
-
-// PendingApproval is deliberately provider-neutral so HTTP and mobile clients
-// do not need to know the Codex JSON-RPC or Grok ACP wire formats.
-type PendingApproval struct {
-	Provider  string           `json:"provider"`
-	ID        string           `json:"id"`
-	Method    string           `json:"method,omitempty"`
-	ThreadID  string           `json:"thread_id,omitempty"`
-	SessionID string           `json:"session_id,omitempty"`
-	TurnID    string           `json:"turn_id,omitempty"`
-	Reason    string           `json:"reason,omitempty"`
-	Summary   string           `json:"summary,omitempty"`
-	Params    map[string]any   `json:"params,omitempty"`
-	Options   []ApprovalOption `json:"options"`
-	CreatedAt time.Time        `json:"created_at"`
-}
+// ApprovalOption and PendingApproval retain the original public API.
+type ApprovalOption = approval.Option
+type PendingApproval = approval.Pending
 
 func approvalOptionLabel(kind, name, fallback string) string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {

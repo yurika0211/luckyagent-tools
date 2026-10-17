@@ -64,6 +64,11 @@ Unconfigured callbacks keep their existing unavailable-service responses.
 | `memory`, `rag`, `credentials`, `chat` | Neutral backend ports, shared data and credential identifier validation |
 | `task`, `collab`, `cron`, `autonomy` | Optional task storage, collaboration, scheduling and durable queue engines with injected executors |
 | `computer`, `multimodal`, `codex`, `grok` | Optional desktop/media providers and external coding-agent clients |
+| `approval`, `hitl` | Neutral approval values and runtime-scoped human approval/input waits |
+| `skillroute` | Matching immutable skill descriptions to natural-language requests |
+| `execpolicy` | Turn-local intent constraints and tool-call decisions using the task policy decision contract |
+| `compact` | Chunking, text-only parallel summaries, validation, local fallback and restoration evidence |
+| `workflow` | DAG execution with host-supplied action handlers and no HTTP framework dependency |
 
 The embedding host owns tool selection, approval prompts, Agent execution,
 memory/RAG persistence, credential storage, provider selection and lifecycle.
@@ -92,6 +97,32 @@ LuckyAgent retains aliases at `internal/tool`, `internal/tool/search`,
 Platform and model application services use the same shared tool types.
 
 ## Inject application capabilities
+
+The execution packages above do not import the root tool catalog, the host, or
+API/gateway modules. `hitl.New` creates one broker per runtime identity and
+notifies the caller with a neutral pending value; the caller renders it and
+resolves replies. Credential input still requires a masked form. Existing root
+`ApprovalOption` and `PendingApproval` remain aliases of the shared values.
+
+`skillroute.Match` accepts skill descriptors and returns an original-slice
+index, score, explicit-name flag and reason, or nil for weak/ambiguous matches.
+`execpolicy.New` accepts per-turn disabled tools/actions; `Evaluate` reuses
+`task.PolicyDecision`, while approvals, quotas and actual dispatch stay in the
+runtime. Neither package loads configuration or executes tools.
+
+`compact.New` accepts an estimator, limits, text-rendering callbacks and a
+text-only `ChatFunc`. `Generate` preserves user-turn boundaries, limits parallel
+calls and merges in history order. Progress callbacks are serialized. Hosts
+validate the final summary before saving their own backups/checkpoints.
+`Validate`, `LocalSummary`, `SelectInput` and `RestoreAttachments` can also be
+used independently. `workflow.NewWorkflowEngine` accepts an executor with
+registered action callbacks; HTTP adapters live in `luckyagent-api/workflow`.
+
+These execution APIs are additions after v0.2.2. Downstream modules must require
+a commit pseudo-version or a newer release containing them. Use matching
+checkouts in a Go workspace during joint development, and merge tools before
+upgrading API and host dependencies. No runtime JSON configuration, tool wire
+name or stored session format is changed by the extraction.
 
 `NewMemoryToolService` consumes `memory.ToolBackend`; `NewRAGToolService`
 consumes the two-method `rag.Backend` search/index port. The module never opens

@@ -40,3 +40,34 @@ func TestNoDependencyOnLuckyAgentRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestExecutionPackagesDoNotDependOnTransportOrToolRoot(t *testing.T) {
+	for _, dir := range []string{"approval", "hitl", "skillroute", "execpolicy", "compact", "workflow"} {
+		t.Run(dir, func(t *testing.T) {
+			err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if entry.IsDir() || !strings.HasSuffix(path, ".go") {
+					return nil
+				}
+				file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+				if err != nil {
+					return err
+				}
+				for _, imp := range file.Imports {
+					name, _ := strconv.Unquote(imp.Path.Value)
+					if name == "github.com/yurika0211/luckyagent-tools" ||
+						strings.HasPrefix(name, "github.com/yurika0211/luckyagent-api") ||
+						strings.HasPrefix(name, "github.com/yurika0211/luckyagent-gateway") {
+						t.Errorf("%s imports application/transport dependency %s", path, name)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

@@ -104,28 +104,61 @@ func TestDelegateToSkill(t *testing.T) {
 
 func TestDelegateToMCP(t *testing.T) {
 	dm := NewDelegateManager(DefaultDelegateConfig())
+	dm.SetMCPExecutor(func(ctx context.Context, server, name string, args map[string]any) (string, error) {
+		if server != "test-server" || name != "search" {
+			t.Errorf("unexpected call %s/%s", server, name)
+		}
+		return "search-ok", nil
+	})
 
 	task, err := dm.DelegateToMCP(context.Background(), "test-server", "search", map[string]any{"query": "test"}, PriorityHigh)
 	if err != nil {
 		t.Fatalf("DelegateToMCP: %v", err)
 	}
-
 	if task.ID == "" {
 		t.Error("expected task ID")
 	}
 
-	// Wait for completion
-	time.Sleep(100 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	var completedTask *DelegateTask
+	for time.Now().Before(deadline) {
+		dm.mu.RLock()
+		found, ok := dm.tasks[task.ID]
+		dm.mu.RUnlock()
+		if ok && (found.Status == StatusCompleted || found.Status == StatusFailed || found.Status == StatusCancelled) {
+			completedTask = found
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if completedTask == nil {
+		t.Fatal("task did not finish")
+	}
+	if completedTask.Status != StatusCompleted || completedTask.Result != "search-ok" {
+		t.Errorf("expected executor result, got status=%s result=%q error=%q", completedTask.Status, completedTask.Result, completedTask.Error)
+	}
+}
 
-	dm.mu.RLock()
-	completedTask, ok := dm.tasks[task.ID]
-	dm.mu.RUnlock()
-	if !ok {
-		t.Fatal("task not found")
+func TestDelegateToMCPWithoutExecutorFails(t *testing.T) {
+	dm := NewDelegateManager(DefaultDelegateConfig())
+	task, err := dm.DelegateToMCP(context.Background(), "test-server", "search", nil, PriorityNormal)
+	if err != nil {
+		t.Fatalf("DelegateToMCP: %v", err)
 	}
-	if completedTask.Status != StatusCompleted {
-		t.Errorf("expected completed, got %s", completedTask.Status)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		dm.mu.RLock()
+		found := dm.tasks[task.ID]
+		dm.mu.RUnlock()
+		if found != nil && found.Status == StatusFailed {
+			if found.Error == "" {
+				t.Fatal("expected executor error")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatal("unconfigured MCP delegation did not fail")
 }
 
 func TestDelegateToSkillTool(t *testing.T) {

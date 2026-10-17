@@ -11,7 +11,7 @@ The root package is named `tool`. Its implementations were extracted from
 LuckyAgent and retain the original MIT license and attribution.
 
 ```bash
-go get github.com/yurika0211/luckyagent-tools@v0.2.1
+go get github.com/yurika0211/luckyagent-tools@v0.2.2
 ```
 
 ## Embed a tool registry

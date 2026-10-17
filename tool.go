@@ -45,9 +45,11 @@ const (
 
 // Tool 代表一个可调用的工具
 type Tool struct {
-	Name            string
-	Description     string
-	Parameters      map[string]Param
+	Name        string
+	Description string
+	Parameters  map[string]Param
+	// InputSchema preserves a provider's complete JSON Schema, including $defs.
+	InputSchema     map[string]any
 	Handler         func(args map[string]any) (string, error)
 	DetailedHandler func(args map[string]any) (ToolCallResult, error)
 	// ContextDetailedHandler is used by tools that need request/session metadata
@@ -172,6 +174,9 @@ func (t *Tool) ToOpenAIFormat() map[string]any {
 	} else {
 		params["required"] = []string{}
 	}
+	if t.InputSchema != nil {
+		params = t.InputSchema
+	}
 
 	return map[string]any{
 		"type": "function",
@@ -247,6 +252,42 @@ func (r *Registry) Register(tool *Tool) {
 	defer r.mu.Unlock()
 	tool.Enabled = true
 	r.tools[tool.Name] = tool
+}
+
+// ReplaceCategory publishes a complete external catalog atomically. A name
+// collision with another category leaves the previous catalog untouched.
+func (r *Registry) ReplaceCategory(category Category, tools []*Tool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	next := make(map[string]*Tool, len(tools))
+	for _, t := range tools {
+		if t == nil || t.Name == "" || t.Category != category {
+			return fmt.Errorf("invalid %s tool catalog", category)
+		}
+		if _, exists := next[t.Name]; exists {
+			return fmt.Errorf("duplicate tool %q", t.Name)
+		}
+		if old := r.tools[t.Name]; old != nil && old.Category != category {
+			return fmt.Errorf("tool name %q already registered", t.Name)
+		}
+		t.Enabled = true
+		if old := r.tools[t.Name]; old != nil {
+			t.Enabled = old.Enabled
+		}
+		next[t.Name] = t
+	}
+	for name, t := range r.tools {
+		if t.Category == category {
+			delete(r.tools, name)
+			if next[name] == nil {
+				delete(r.permConf, name)
+			}
+		}
+	}
+	for name, t := range next {
+		r.tools[name] = t
+	}
+	return nil
 }
 
 // Unregister 注销工具

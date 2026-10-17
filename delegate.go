@@ -455,6 +455,7 @@ type DelegateManager struct {
 	nextID                   int
 	agentExecutor            AgentExecutorFunc // v0.38.0: 真正的 Agent 执行器
 	agentExecutorWithOptions AgentExecutorWithOptionsFunc
+	mcpExecutor              func(context.Context, string, string, map[string]any) (string, error)
 	sessionInitializer       func(*DelegateTask) error
 	taskStore                taskstore.Store
 	taskEvents               *taskstore.EventBus
@@ -467,6 +468,14 @@ func NewDelegateManager(cfg DelegateConfig) *DelegateManager {
 		tasks:   make(map[string]*DelegateTask),
 		cancels: make(map[string]context.CancelFunc),
 	}
+}
+
+// SetMCPExecutor injects the host's adapter. Delegation never owns an MCP
+// transport or invents a successful result when no executor is configured.
+func (dm *DelegateManager) SetMCPExecutor(fn func(context.Context, string, string, map[string]any) (string, error)) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.mcpExecutor = fn
 }
 
 // SetAgentExecutor 设置 Agent 执行器 (v0.38.0)

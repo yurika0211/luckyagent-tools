@@ -277,47 +277,36 @@ func (dm *DelegateManager) executeSkillTask(ctx context.Context, taskID, skillNa
 	}
 }
 
-// executeMCPTask executes a task by calling an MCP server tool.
+// executeMCPTask executes a task through the host-injected MCP executor.
+// Delegation does not own a transport and does not invent a successful result.
 func (dm *DelegateManager) executeMCPTask(ctx context.Context, taskID, serverName, toolName string, args map[string]any) {
 	dm.mu.Lock()
 	task := dm.tasks[taskID]
 	task.Status = StatusRunning
+	executor, timeout := dm.mcpExecutor, dm.config.Timeout
 	dm.mu.Unlock()
-
-	timeout := dm.config.Timeout
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < timeout {
-			timeout = remaining
-		}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var result string
+	var err error
+	if executor == nil {
+		err = fmt.Errorf("MCP executor is not configured")
+	} else {
+		result, err = executor(ctx, serverName, toolName, args)
 	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// v0.5.0: Simplified — real implementation would use MCPClient.CallTool
-		dm.mu.Lock()
-		task.Status = StatusCompleted
-		task.Result = fmt.Sprintf("MCP %s/%s completed", serverName, toolName)
-		task.CompletedAt = time.Now()
-		dm.mu.Unlock()
-	}()
-
-	select {
-	case <-done:
-		return
-	case <-time.After(timeout):
-		dm.mu.Lock()
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	task.CompletedAt = time.Now()
+	if err != nil {
 		task.Status = StatusFailed
-		task.Error = "timeout"
-		task.CompletedAt = time.Now()
-		dm.mu.Unlock()
-	case <-ctx.Done():
-		dm.mu.Lock()
-		task.Status = StatusCancelled
-		task.Error = "context cancelled"
-		task.CompletedAt = time.Now()
-		dm.mu.Unlock()
+		task.Error = err.Error()
+		if ctx.Err() == context.Canceled {
+			task.Status = StatusCancelled
+		}
+		return
 	}
+	task.Status = StatusCompleted
+	task.Result = result
 }
 
 // PriorityTaskQueue is a thread-safe priority queue for delegated tasks.

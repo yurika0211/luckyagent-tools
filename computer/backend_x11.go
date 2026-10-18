@@ -57,20 +57,19 @@ func (b *X11Backend) Capabilities(ctx context.Context) (Capabilities, error) {
 		return Capabilities{}, errors.New("computer: x11 backend requires DISPLAY")
 	}
 	if _, err := exec.LookPath(b.screen); err != nil {
-		return Capabilities{}, fmt.Errorf("computer: x11 screenshot requires %q (ImageMagick import): %w", b.screen, err)
+		if _, _, nativeErr := localX11Display(b.display); nativeErr != nil {
+			return Capabilities{}, fmt.Errorf("computer: x11 screenshot requires %q for remote displays: %w", b.screen, err)
+		}
 	}
 	if _, err := exec.LookPath(b.input); err != nil {
 		return Capabilities{Capture: true, BackendDetail: "screenshot only"}, fmt.Errorf("computer: x11 input requires %q (xdotool): %w", b.input, err)
 	}
-	return Capabilities{Capture: true, Click: true, DoubleClick: true, Move: true, Drag: true, TypeText: true, Keypress: true, Scroll: true, WindowCapture: true, Accessibility: true, ScaleFactor: 1, BackendDetail: "ImageMagick import + xdotool; optional AT-SPI via Python GI"}, nil
+	return Capabilities{Capture: true, Click: true, DoubleClick: true, Move: true, Drag: true, TypeText: true, Keypress: true, Scroll: true, WindowCapture: true, Accessibility: true, ScaleFactor: 1, BackendDetail: "ImageMagick import with local X11 GetImage fallback + xdotool; optional AT-SPI via Python GI"}, nil
 }
 
 func (b *X11Backend) Capture(ctx context.Context, target Target) (Observation, error) {
 	if b.display == "" {
 		return Observation{}, errors.New("computer: x11 screenshot unavailable: DISPLAY is not set")
-	}
-	if _, err := exec.LookPath(b.screen); err != nil {
-		return Observation{}, fmt.Errorf("computer: x11 screenshot requires %q (ImageMagick import): %w", b.screen, err)
 	}
 	if target.DisplayID != "" && target.DisplayID != b.display {
 		return Observation{}, fmt.Errorf("computer: x11 captures the root display %q; unknown display_id %q", b.display, target.DisplayID)
@@ -102,15 +101,9 @@ func (b *X11Backend) Capture(ctx context.Context, target Target) (Observation, e
 	}
 	// Target.DisplayID is a logical display selector. It is not an X11
 	// connection string, so never substitute it for the backend DISPLAY value.
-	args := []string{"-display", b.display, "-window", "root"}
-	if !crop.Empty() {
-		args = append(args, "-crop", fmt.Sprintf("%dx%d+%d+%d", crop.Dx(), crop.Dy(), crop.Min.X, crop.Min.Y), "+repage")
-	}
-	args = append(args, path)
-	cmd := exec.CommandContext(ctx, b.screen, args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if err := b.captureScreenshot(ctx, path, crop); err != nil {
 		_ = os.Remove(path)
-		return Observation{}, fmt.Errorf("computer: x11 screenshot command failed: %w (%s)", err, strings.TrimSpace(string(out)))
+		return Observation{}, err
 	}
 	obs := Observation{FilePath: path, MimeType: "image/png", DisplayID: target.DisplayID, CleanupFile: true, ActiveWindow: title, WindowBounds: bounds, WindowID: windowID, OriginX: crop.Min.X, OriginY: crop.Min.Y, windowScoped: target.Window != ""}
 	if obs.DisplayID == "" {
@@ -137,6 +130,28 @@ func (b *X11Backend) Capture(ctx context.Context, target Target) (Observation, e
 		return Observation{}, fmt.Errorf("computer: X11 screenshot %dx%d does not match requested display/window %dx%d; check DISPLAY and the session backend", obs.Width, obs.Height, expected.Dx(), expected.Dy())
 	}
 	return obs, nil
+}
+
+func (b *X11Backend) captureScreenshot(ctx context.Context, path string, crop image.Rectangle) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	args := []string{"-display", b.display, "-window", "root"}
+	if !crop.Empty() {
+		args = append(args, "-crop", fmt.Sprintf("%dx%d+%d+%d", crop.Dx(), crop.Dy(), crop.Min.X, crop.Min.Y), "+repage")
+	}
+	args = append(args, path)
+	out, primaryErr := exec.CommandContext(ctx, b.screen, args...).CombinedOutput()
+	if primaryErr == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := captureNativeX11(ctx, b.display, path, crop); err != nil {
+		return fmt.Errorf("computer: x11 screenshot command failed: %w (%s); native GetImage fallback: %v", primaryErr, strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (b *X11Backend) rootBounds(ctx context.Context) (image.Rectangle, error) {

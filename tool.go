@@ -168,6 +168,7 @@ func (t *Tool) ToOpenAIFormat() map[string]any {
 		}
 		props[name] = paramDef
 	}
+	sort.Strings(required)
 	params["properties"] = props
 	if len(required) > 0 {
 		params["required"] = required

@@ -60,9 +60,10 @@ Unconfigured callbacks keep their existing unavailable-service responses.
 | `sandbox` | Execution mode, task snapshots, path checks and isolated shell commands |
 | `opencli` | Host-independent OpenCLI configuration DTO |
 | `textutil` | Shared text, HTML and URL formatting helpers |
-| Root runtime services | Memory/RAG handlers, delegation, cron/autonomy/heartbeat tools, media/computer tools, temporary credential tools and coding-agent bridges |
+| Root runtime services | Memory/RAG handlers, delegation/autonomy tool adapters, cron/heartbeat tools, media/computer tools, temporary credential tools and coding-agent bridges |
 | `memory`, `rag`, `credentials`, `chat` | Neutral backend ports, shared data and credential identifier validation |
-| `task`, `collab`, `cron`, `autonomy` | Optional task storage, collaboration, scheduling and durable queue engines with injected executors |
+| `task`, `collab`, `autonomy` | Deprecated compatibility aliases to the independent `luckyagent-orchestrator` engines |
+| `cron` | Generic scheduled job engine |
 | `computer`, `multimodal`, `codex`, `grok` | Optional desktop/media providers and external coding-agent clients |
 | `approval`, `hitl` | Neutral approval values and runtime-scoped human approval/input waits |
 | `skillroute` | Matching immutable skill descriptions to natural-language requests |
@@ -75,6 +76,11 @@ memory/RAG persistence, credential storage, provider selection and lifecycle.
 Reusable execution, validation and rendering live here. Permission metadata
 and deny/sandbox checks are preserved; dispatch itself does not ask a human for
 approval. The host resolves `PermApprove` before calling a handler.
+
+Task storage, collaboration, autonomy and ordinary-delegation management now
+live in `github.com/yurika0211/luckyagent-orchestrator`. This SDK retains tool
+definitions and public compatibility names. See [orchestration adapters](docs/orchestration.md)
+for ownership, the `v0.1.0` engine dependency and local development.
 
 Defaults preserve LuckyAgent-compatible file roots and environment behavior.
 Filesystem read policies and task sandbox snapshots remain explicit inputs;

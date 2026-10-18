@@ -3,7 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
-	"github.com/yurika0211/luckyagent-tools/autonomy"
+	"github.com/yurika0211/luckyagent-orchestrator/autonomy"
 	"strings"
 	"testing"
 )

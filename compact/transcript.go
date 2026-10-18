@@ -44,7 +44,14 @@ func SummaryContext(ctx context.Context) (context.Context, context.CancelFunc) {
 			base = context.WithoutCancel(ctx)
 		}
 	}
-	return context.WithTimeout(base, SummaryTimeout)
+	summary, cancel := context.WithTimeout(base, SummaryTimeout)
+	// Extending a short deadline must not detach an explicit user cancellation.
+	stop := context.AfterFunc(ctx, func() {
+		if ctx.Err() == context.Canceled {
+			cancel()
+		}
+	})
+	return summary, func() { stop(); cancel() }
 }
 
 // compactTranscript renders session messages into a budgeted plain-text

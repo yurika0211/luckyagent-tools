@@ -47,6 +47,15 @@ func Validate(summary string, messages []Message) Validation {
 	if compactMessagesNeedEvidence(messages) && !compactSummaryHasEvidence(summary) {
 		validation.Missing = append(validation.Missing, "file/tool/error/test evidence")
 	}
+	for _, line := range sectionBullets(summary, "Completed work") {
+		text := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "-")))
+		for _, prefix := range []string{"i will ", "i'll ", "我会", "我将", "下一步", "准备去"} {
+			if strings.HasPrefix(text, prefix) {
+				validation.Missing = append(validation.Missing, "completed work must not contain future plans")
+				break
+			}
+		}
+	}
 
 	if len(validation.Missing) > 0 {
 		validation.Reason = "missing " + strings.Join(validation.Missing, ", ")

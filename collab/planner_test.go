@@ -218,7 +218,26 @@ func TestDelegateManagerAutoModeUsesPlanner(t *testing.T) {
 		t.Fatalf("delegate: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	// Completion is persisted asynchronously; wait for its final event rather
+	// than assuming file writes finish within a fixed scheduler interval.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		events, err := store.Events(task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		finished := false
+		for _, event := range events {
+			if event.Type == taskstore.EventCompleted && event.TaskID == task.ID {
+				finished = true
+				break
+			}
+		}
+		if finished {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	updated, ok := dm.GetTask(task.ID)
 	if !ok {
 		t.Fatal("task not found")

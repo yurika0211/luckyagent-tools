@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/jezek/xgb v1.3.1
 	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sys v0.42.0

@@ -124,9 +124,13 @@ func TestDelegateToMCP(t *testing.T) {
 	for time.Now().Before(deadline) {
 		dm.mu.RLock()
 		found, ok := dm.tasks[task.ID]
+		var snapshot DelegateTask
+		if ok {
+			snapshot = *found
+		}
 		dm.mu.RUnlock()
-		if ok && (found.Status == StatusCompleted || found.Status == StatusFailed || found.Status == StatusCancelled) {
-			completedTask = found
+		if ok && (snapshot.Status == StatusCompleted || snapshot.Status == StatusFailed || snapshot.Status == StatusCancelled) {
+			completedTask = &snapshot
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -149,9 +153,13 @@ func TestDelegateToMCPWithoutExecutorFails(t *testing.T) {
 	for time.Now().Before(deadline) {
 		dm.mu.RLock()
 		found := dm.tasks[task.ID]
+		var snapshot DelegateTask
+		if found != nil {
+			snapshot = *found
+		}
 		dm.mu.RUnlock()
-		if found != nil && found.Status == StatusFailed {
-			if found.Error == "" {
+		if found != nil && snapshot.Status == StatusFailed {
+			if snapshot.Error == "" {
 				t.Fatal("expected executor error")
 			}
 			return
@@ -473,11 +481,12 @@ func TestDelegateToSkillWithContextCancellation(t *testing.T) {
 
 	dm.mu.RLock()
 	completedTask, _ := dm.tasks[task.ID]
+	completedStatus := completedTask.Status
 	dm.mu.RUnlock()
 
-	if completedTask.Status != StatusCancelled && completedTask.Status != StatusCompleted {
+	if completedStatus != StatusCancelled && completedStatus != StatusCompleted {
 		// Either cancelled or completed quickly is acceptable
-		t.Logf("Task status: %s", completedTask.Status)
+		t.Logf("Task status: %s", completedStatus)
 	}
 }
 

@@ -138,3 +138,10 @@ they enable and close owned services during shutdown. `NewServices` assembles
 the runtime catalog. `RegisterRuntimeBuiltinTools[WithConfig]` adds the optional
 media tools; the existing `RegisterBuiltinTools[WithConfig]` remains the generic
 standalone catalog for source compatibility.
+
+## Desktop capture and tool schemas
+
+The X11 backend has a bounded native screenshot fallback when ImageMagick is
+missing or fails; see [X11 capture](docs/x11-capture.md). Tool conversion sorts
+the JSON Schema `required` array so map iteration does not reorder required
+parameter names between otherwise identical requests.

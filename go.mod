@@ -6,7 +6,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/stretchr/testify v1.11.1
-	github.com/yurika0211/luckyagent-orchestrator v0.1.0
+	github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261018032905-4c324046dcd7
 	golang.org/x/sys v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 )

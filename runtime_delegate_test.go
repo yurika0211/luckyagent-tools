@@ -228,6 +228,7 @@ func TestDelegatedTasksAreIsolatedBySessionAndIdempotent(t *testing.T) {
 
 func TestDelegateTaskCall(t *testing.T) {
 	dm := NewDelegateManager(DefaultDelegateConfig())
+	dm.SetAgentExecutor(func(context.Context, string, string) (string, error) { return "executed task", nil })
 	r := NewRegistry()
 	r.Register(DelegateTaskTool(dm))
 	r.Register(TaskStatusTool(dm))

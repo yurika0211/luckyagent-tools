@@ -88,18 +88,15 @@ func TestDelegateManager_Config(t *testing.T) {
 	}
 
 	// 验证默认配置
-	if dm.config.MaxConcurrent <= 0 {
+	if dm.Config().MaxConcurrent <= 0 {
 		t.Log("Using default max concurrent")
 	}
 }
 
 // TestDelegateManager_ConcurrentLimit 测试并发限制
 func TestDelegateManager_ConcurrentLimit(t *testing.T) {
-	cfg := DelegateConfig{}
+	cfg := DelegateConfig{MaxConcurrent: 2}
 	dm := NewDelegateManager(cfg)
-
-	// 设置较小的并发数
-	dm.config.MaxConcurrent = 2
 
 	tasks := []string{
 		"task 1",
@@ -294,7 +291,7 @@ func TestDelegateManager_HandleDelegateParallel(t *testing.T) {
 
 	// handleDelegateParallel 应该能处理空 tasks
 	// 由于实际实现可能不同，这里只验证不 panic
-	result, err := dm.handleDelegateParallel(args)
+	result, err := dm.HandleDelegateParallel(args)
 	t.Logf("handleDelegateParallel result: %s, err: %v", result, err)
 }
 
@@ -309,6 +306,6 @@ func TestDelegateManager_HandleDelegateParallelWithTasks(t *testing.T) {
 		"timeout": 60,
 	}
 
-	result, err := dm.handleDelegateParallel(args)
+	result, err := dm.HandleDelegateParallel(args)
 	t.Logf("handleDelegateParallel with tasks: %s, err: %v", result, err)
 }

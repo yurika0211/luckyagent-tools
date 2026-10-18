@@ -124,6 +124,9 @@ validate the final summary before saving their own backups/checkpoints.
 used independently. `workflow.NewWorkflowEngine` accepts an executor with
 registered action callbacks; HTTP adapters live in `luckyagent-api/workflow`.
 
+See [compaction evidence and cancellation](docs/compaction.md) for local-fallback
+claims, final validation responsibilities and parent cancellation behavior.
+
 These execution APIs are additions after v0.2.2. Downstream modules must require
 a commit pseudo-version or a newer release containing them. Use matching
 checkouts in a Go workspace during joint development, and merge tools before

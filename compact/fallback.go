@@ -9,6 +9,7 @@ import (
 func LocalSummary(messages []Message, opts TextOptions) string {
 	var userGoal string
 	var completed []string
+	var unverified []string
 	var pending []string
 	var files []string
 	var commands []string
@@ -27,7 +28,7 @@ func LocalSummary(messages []Message, opts TextOptions) string {
 				constraints = append(constraints, "- "+truncate(text, 160))
 			}
 		case "assistant":
-			completed = append(completed, "- "+truncate(text, 180))
+			unverified = append(unverified, "- Prior assistant statement (unverified): "+truncate(text, 180))
 		case "tool":
 			if summary := opts.summarizeTool(msg.Name, text); summary != "" {
 				commands = append(commands, "- tool "+strings.TrimSpace(msg.Name)+": "+summary)
@@ -94,6 +95,9 @@ func LocalSummary(messages []Message, opts TextOptions) string {
 		b.WriteString(line + "\n")
 	}
 	b.WriteString("Uncertain facts:\n")
+	for _, line := range textutil.DedupStringsLimit(unverified, 4) {
+		b.WriteString(line + "\n")
+	}
 	b.WriteString("- This compact summary was generated locally without an LLM; verify repository state before treating prior progress as complete.\n")
 
 	summary := strings.TrimSpace(b.String())

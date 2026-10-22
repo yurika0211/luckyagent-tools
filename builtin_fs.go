@@ -83,7 +83,7 @@ func TerminalTool() *Tool {
 		ParallelSafe: false,
 		Parameters: map[string]Param{
 			"command": {Type: "string", Description: "Concrete terminal command to run. Prefer precise inspection or execution commands over exploratory one-liners.", Required: true},
-			"timeout": {Type: "number", Description: "Timeout in seconds (default 30)", Required: false, Default: 30},
+			"timeout": {Type: "number", Description: "Timeout in seconds (default 30, max 900). Long builds and tests should pass this explicitly.", Required: false, Default: 30},
 			"workdir": {Type: "string", Description: "Optional working directory. Use when the command must run in a specific project or subdirectory.", Required: false},
 		},
 		Handler: handleShell,
@@ -114,21 +114,7 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 		return "", shellFileReadRedirectError(toolName, path)
 	}
 
-	timeout := 30
-	if t, ok := args["timeout"]; ok {
-		switch v := t.(type) {
-		case float64:
-			timeout = int(v)
-		case int:
-			timeout = v
-		}
-	}
-	if timeout <= 0 {
-		timeout = 30
-	}
-	if timeout > 300 {
-		timeout = 300
-	}
+	timeout := clampShellTimeout(shellTimeoutArg(args))
 
 	cwd, _ := args["_cwd"].(string)
 	env, _ := args["_env"].(map[string]string)
@@ -166,6 +152,7 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	configureShellProcessGroup(cmd)
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Run() }()
@@ -184,11 +171,52 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 		}
 		return output, nil
 	case <-time.After(ctx):
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
+		killShellProcessGroup(cmd)
 		return "", fmt.Errorf("command timed out after %d seconds", timeout)
 	}
+}
+
+func shellTimeoutArg(args map[string]any) int {
+	timeout := 30
+	if t, ok := args["timeout"]; ok {
+		switch v := t.(type) {
+		case float64:
+			timeout = int(v)
+		case int:
+			timeout = v
+		}
+	}
+	return timeout
+}
+
+func clampShellTimeout(timeout int) int {
+	if timeout <= 0 {
+		return 30
+	}
+	if timeout > 900 {
+		return 900
+	}
+	return timeout
+}
+
+func configureShellProcessGroup(cmd *exec.Cmd) {
+	if cmd == nil || runtime.GOOS == "windows" {
+		return
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+}
+
+func killShellProcessGroup(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if runtime.GOOS != "windows" && cmd.Process.Pid > 0 {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
 }
 
 func shellEnvPrefix(env map[string]string, goos string) string {
@@ -1563,7 +1591,7 @@ func validateSandboxForOperation(cleanPath string, op filesystemOperation, polic
 			}
 		}
 	}
-	return fmt.Errorf("access denied: path is outside sandbox (allowed: ~/.luckyagent/, /tmp/). Requested: %s", cleanPath)
+	return fmt.Errorf("access denied: path is outside sandbox (allowed: ~/.luckyagent/, /tmp/; add tools.filesystem.allowed_read_roots for read-only paths, then restart). Requested: %s", cleanPath)
 }
 
 func normalizeFilesystemCandidate(path string) string {

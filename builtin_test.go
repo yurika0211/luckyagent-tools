@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCurrentTimeTool(t *testing.T) {
@@ -1320,6 +1322,64 @@ func TestConfiguredReadRootDoesNotAllowWrite(t *testing.T) {
 	}
 	if _, err := os.Stat(writePath); !os.IsNotExist(err) {
 		t.Fatalf("external file should not have been written, stat err %v", err)
+	}
+}
+
+func TestShellTimeoutKillsChildProcesses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group kill is unix-only")
+	}
+	marker := filepath.Join(t.TempDir(), "child-alive")
+	command := fmt.Sprintf("sleep 30 & echo $! > %s; wait", marker)
+	start := time.Now()
+	_, err := handleShell(map[string]any{"command": command, "timeout": 1})
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "timed out after 1 seconds") {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if elapsed > 8*time.Second {
+		t.Fatalf("timeout returned too slowly: %s", elapsed)
+	}
+	pidBytes, readErr := os.ReadFile(marker)
+	if readErr != nil {
+		t.Fatalf("child pid marker missing: %v", readErr)
+	}
+	pid := strings.TrimSpace(string(pidBytes))
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if exec.Command("ps", "-p", pid).Run() != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("child process %s still alive after shell timeout", pid)
+}
+
+func TestShellTimeoutClamp(t *testing.T) {
+	if got := clampShellTimeout(0); got != 30 {
+		t.Fatalf("non-positive timeout = %d, want 30", got)
+	}
+	if got := clampShellTimeout(30); got != 30 {
+		t.Fatalf("default timeout = %d, want 30", got)
+	}
+	if got := clampShellTimeout(900); got != 900 {
+		t.Fatalf("max timeout = %d, want 900", got)
+	}
+	if got := clampShellTimeout(5000); got != 900 {
+		t.Fatalf("over-max timeout = %d, want 900", got)
+	}
+}
+
+func TestSandboxDenialNamesReadRootConfig(t *testing.T) {
+	err := validateSandboxForOperation("/definitely/not/in/sandbox", filesystemRead, DefaultFilesystemPolicy())
+	if err == nil {
+		t.Fatal("expected sandbox denial")
+	}
+	msg := err.Error()
+	for _, want := range []string{"outside sandbox", "tools.filesystem.allowed_read_roots", "Requested:"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("sandbox denial %q missing %q", msg, want)
+		}
 	}
 }
 

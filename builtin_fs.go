@@ -110,6 +110,9 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 			return "", err
 		}
 	}
+	if toolName, path, ok := shellFileReadRedirect(command); ok {
+		return "", shellFileReadRedirectError(toolName, path)
+	}
 
 	timeout := 30
 	if t, ok := args["timeout"]; ok {

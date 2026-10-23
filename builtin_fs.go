@@ -203,26 +203,6 @@ func clampShellTimeout(timeout int) int {
 	return timeout
 }
 
-func configureShellProcessGroup(cmd *exec.Cmd) {
-	if cmd == nil || runtime.GOOS == "windows" {
-		return
-	}
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setpgid = true
-}
-
-func killShellProcessGroup(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	if runtime.GOOS != "windows" && cmd.Process.Pid > 0 {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	_ = cmd.Process.Kill()
-}
-
 func shellEnvPrefix(env map[string]string, goos string) string {
 	validEnvKey := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	var b strings.Builder

@@ -7,7 +7,7 @@ require (
 	github.com/jezek/xgb v1.3.1
 	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/stretchr/testify v1.11.1
-	github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261018033818-5198cd311287
+	github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261019181659-18ef78990cea
 	golang.org/x/sys v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 )

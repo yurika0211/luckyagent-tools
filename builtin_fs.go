@@ -153,9 +153,12 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	configureShellProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
 
 	done := make(chan error, 1)
-	go func() { done <- cmd.Run() }()
+	go func() { done <- cmd.Wait() }()
 
 	select {
 	case err := <-done:
@@ -172,6 +175,7 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 		return output, nil
 	case <-time.After(ctx):
 		killShellProcessGroup(cmd)
+		<-done
 		return "", fmt.Errorf("command timed out after %d seconds", timeout)
 	}
 }

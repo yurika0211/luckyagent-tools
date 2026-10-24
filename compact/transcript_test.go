@@ -31,8 +31,8 @@ func TestCompactTranscriptCapsSizeAndSummarizesTools(t *testing.T) {
 	if got := utf8.RuneCountInString(out); got > TranscriptMaxRunes+200 {
 		t.Fatalf("transcript too large: %d runes (budget %d)", got, TranscriptMaxRunes)
 	}
-	if !strings.Contains(out, "compact transcript truncated") {
-		t.Fatalf("expected truncation note in oversized transcript, got prefix:\n%s", out[:min(len(out), 240)])
+	if !strings.Contains(out, "omitted for context") {
+		t.Fatalf("expected an omission record in oversized transcript, got prefix:\n%s", out[:min(len(out), 240)])
 	}
 	if strings.Contains(out, "should not appear") {
 		t.Fatal("compact boundary content must not enter the transcript")

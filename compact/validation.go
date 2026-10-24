@@ -20,7 +20,23 @@ type Validation struct {
 	HasNextStep bool
 }
 
-func Validate(summary string, messages []Message) Validation {
+// ValidateOptions carries checks that a caller opts into. A zero value changes
+// nothing about Validate.
+type ValidateOptions struct {
+	// RequiredIdentifiers are substrings the summary must keep. A missing one
+	// fails validation and is named in Validation.Missing, prefixed with
+	// "identifier: ".
+	RequiredIdentifiers []string
+}
+
+// Validate checks the summary shape: length, the required sections, and that
+// completed work does not contain a future plan.
+//
+// Identifier recall is not guessed here. A caller that wants it passes the
+// identifiers the summary must keep through ValidateOptions.RequiredIdentifiers,
+// usually the result of Identifiers. Leaving the slice empty keeps the
+// v0.2.3 checks and does not invent a second extractor.
+func Validate(summary string, messages []Message, opts ...ValidateOptions) Validation {
 	summary = strings.TrimSpace(summary)
 	validation := Validation{
 		CharCount:  len([]rune(summary)),
@@ -54,6 +70,11 @@ func Validate(summary string, messages []Message) Validation {
 				validation.Missing = append(validation.Missing, "completed work must not contain future plans")
 				break
 			}
+		}
+	}
+	if len(opts) > 0 {
+		for _, missing := range MissingIdentifiers(summary, opts[0].RequiredIdentifiers) {
+			validation.Missing = append(validation.Missing, "identifier: "+missing)
 		}
 	}
 

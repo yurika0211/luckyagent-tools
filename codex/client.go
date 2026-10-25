@@ -502,12 +502,29 @@ func (m *Manager) ResumeThread(ctx context.Context, threadID string, cwd string)
 	if id := stringValue(threadMap, "id"); id != "" {
 		threadID = id
 	}
-	thread := Thread{ID: threadID, CWD: cwd, Status: "idle", CreatedAt: time.Now().UTC()}
 	m.mu.Lock()
+	cached := ""
+	if existing := m.threads[threadID]; existing != nil {
+		cached = existing.CWD
+	}
+	cwd = resumeThreadCWD(cached, cwd, stringValue(threadMap, "cwd"))
+	thread := Thread{ID: threadID, CWD: cwd, Status: "idle", CreatedAt: time.Now().UTC()}
 	m.threads[threadID] = &thread
 	m.mu.Unlock()
 	m.recordEvent("thread/resumed", threadID, "", "Thread resumed", nil)
 	return thread, nil
+}
+
+// resumeThreadCWD keeps a known workspace when resume is called without cwd.
+// An explicit argument wins, then the app-server response, then the cache.
+func resumeThreadCWD(cached, input, response string) string {
+	if cwd := strings.TrimSpace(input); cwd != "" {
+		return cwd
+	}
+	if cwd := strings.TrimSpace(response); cwd != "" {
+		return cwd
+	}
+	return strings.TrimSpace(cached)
 }
 
 func (m *Manager) StartTurn(ctx context.Context, threadID, input, model string) (Turn, error) {

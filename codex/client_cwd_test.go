@@ -35,3 +35,18 @@ func TestValidateCWDAllowlist(t *testing.T) {
 		t.Fatal("sibling cwd accepted")
 	}
 }
+
+func TestResumeThreadCWDKeepsCache(t *testing.T) {
+	if got := resumeThreadCWD("/proj", "", ""); got != "/proj" {
+		t.Fatalf("empty resume cwd = %q", got)
+	}
+	if got := resumeThreadCWD("/proj", "/other", "/server"); got != "/other" {
+		t.Fatalf("explicit cwd = %q", got)
+	}
+	if got := resumeThreadCWD("/proj", "  ", "/server"); got != "/server" {
+		t.Fatalf("response cwd = %q", got)
+	}
+	if got := resumeThreadCWD("", " ", " "); got != "" {
+		t.Fatalf("blank cwd = %q", got)
+	}
+}

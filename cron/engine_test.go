@@ -170,6 +170,46 @@ func TestEngineAddJob(t *testing.T) {
 	}
 }
 
+func TestSetDeleteAfterRunKeepsSchedule(t *testing.T) {
+	e := NewEngine()
+	schedule := IntervalSchedule{Interval: time.Hour}
+	if err := e.AddJob("once", "Once", "desc", schedule, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	before, ok := e.GetJob("once")
+	if !ok {
+		t.Fatal("job missing after add")
+	}
+	if before.NextRun.IsZero() {
+		t.Fatal("AddJob left NextRun zero")
+	}
+	before.RunCount = 3
+	if err := e.RestoreJobState("once", RestoredJobState{
+		Status:     before.Status.String(),
+		RunCount:   3,
+		NextRun:    &before.NextRun,
+		CreatedAt:  &before.CreatedAt,
+		UpdatedAt:  &before.UpdatedAt,
+		RunHistory: []RunRecord{{RunAt: before.CreatedAt, Status: "ok"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.SetDeleteAfterRun("once", true); err != nil {
+		t.Fatal(err)
+	}
+	after, ok := e.GetJob("once")
+	if !ok || !after.DeleteAfterRun {
+		t.Fatalf("flag not set: %+v ok=%v", after, ok)
+	}
+	if !after.NextRun.Equal(before.NextRun) || after.RunCount != 3 || after.Status != StatusIdle || len(after.RunHistory) != 1 {
+		t.Fatalf("SetDeleteAfterRun changed runtime state: %+v", after)
+	}
+	if err := e.SetDeleteAfterRun("missing", true); err == nil {
+		t.Fatal("missing job should fail")
+	}
+}
+
 func TestEngineRemoveJob(t *testing.T) {
 	e := NewEngine()
 	e.AddJob("test", "Test Job", "desc", IntervalSchedule{Interval: 1 * time.Hour}, func() error {

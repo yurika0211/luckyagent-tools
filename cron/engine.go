@@ -647,6 +647,21 @@ func (e *Engine) RestoreJobState(id string, state RestoredJobState) error {
 	return nil
 }
 
+// SetDeleteAfterRun updates only the delete-after-run flag. RestoreJobState
+// replaces counters, history, and status, so a one-field update must not use it.
+func (e *Engine) SetDeleteAfterRun(id string, deleteAfterRun bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	job, exists := e.jobs[id]
+	if !exists {
+		return fmt.Errorf("job %s not found", id)
+	}
+	job.DeleteAfterRun = deleteAfterRun
+	e.notifyWakeLocked()
+	return nil
+}
+
 type RestoredJobState struct {
 	Status         string
 	Paused         bool

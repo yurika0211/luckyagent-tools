@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -32,5 +33,25 @@ func TestWorkspaceWriteStillEnforcesBoundary(t *testing.T) {
 	}
 	if err := snapshot.ValidateToolArgs("web_fetch", map[string]any{}); err == nil || !strings.Contains(err.Error(), "disabled") {
 		t.Fatalf("network tool was not blocked: %v", err)
+	}
+}
+
+func TestPrepareIsoRejectsCopyLimitsBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "large.txt"), []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareWithLimits(ModeIso, root, CopyLimits{MaxBytes: 4, MaxFiles: 10, MaxSymlinks: 0}); err == nil || !strings.Contains(err.Error(), "cap 4") {
+		t.Fatalf("expected byte cap error, got %v", err)
+	}
+}
+
+func TestPrepareIsoRejectsSymlinksBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink("missing", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareWithLimits(ModeIso, root, CopyLimits{MaxBytes: 100, MaxFiles: 10, MaxSymlinks: 0}); err == nil || !strings.Contains(err.Error(), "symlink count") {
+		t.Fatalf("expected symlink cap error, got %v", err)
 	}
 }

@@ -24,6 +24,25 @@ const (
 	ModeWorkspaceWrite Mode = "workspace-write"
 )
 
+// Copy limits protect an explicitly requested iso turn from copying an
+// accidentally broad workspace before bubblewrap can start. They are kept
+// here, next to Prepare, so all callers share the same guard.
+const (
+	DefaultMaxCopyBytes    = int64(512 * 1024 * 1024)
+	DefaultMaxCopyFiles    = 100_000
+	DefaultMaxCopySymlinks = 0
+)
+
+type CopyLimits struct {
+	MaxBytes    int64
+	MaxFiles    int
+	MaxSymlinks int
+}
+
+func defaultCopyLimits() CopyLimits {
+	return CopyLimits{MaxBytes: DefaultMaxCopyBytes, MaxFiles: DefaultMaxCopyFiles, MaxSymlinks: DefaultMaxCopySymlinks}
+}
+
 func (m Mode) Valid() bool { return m == ModeDev || m == ModeIso || m == ModeWorkspaceWrite }
 
 func (m Mode) String() string {
@@ -251,8 +270,24 @@ func stringArg(args map[string]any, key string) string {
 // Git metadata and obvious local secret files. The original tree is never
 // mounted into the isolated process.
 func Prepare(mode Mode, root string) (*Snapshot, error) {
+	return PrepareWithLimits(mode, root, defaultCopyLimits())
+}
+
+// PrepareWithLimits is useful to hosts that want a stricter per-turn cap. A
+// caller may only lower the defaults; zero means use the default limit.
+func PrepareWithLimits(mode Mode, root string, limits CopyLimits) (*Snapshot, error) {
 	if !mode.Valid() {
 		mode = ModeDev
+	}
+	defaults := defaultCopyLimits()
+	if limits.MaxBytes <= 0 || limits.MaxBytes > defaults.MaxBytes {
+		limits.MaxBytes = defaults.MaxBytes
+	}
+	if limits.MaxFiles <= 0 || limits.MaxFiles > defaults.MaxFiles {
+		limits.MaxFiles = defaults.MaxFiles
+	}
+	if limits.MaxSymlinks < 0 || limits.MaxSymlinks > defaults.MaxSymlinks {
+		limits.MaxSymlinks = defaults.MaxSymlinks
 	}
 	root = strings.TrimSpace(root)
 	if root == "" {
@@ -279,11 +314,65 @@ func Prepare(mode Mode, root string) (*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create isolated workspace: %w", err)
 	}
+	if err := checkCopyLimits(root, limits); err != nil {
+		_ = os.RemoveAll(dest)
+		return nil, fmt.Errorf("iso workspace exceeds copy limit: %w", err)
+	}
 	if err := copyTree(root, dest); err != nil {
 		_ = os.RemoveAll(dest)
 		return nil, fmt.Errorf("copy isolated workspace: %w", err)
 	}
 	return &Snapshot{Mode: ModeIso, OriginalRoot: root, Root: dest}, nil
+}
+
+func checkCopyLimits(src string, limits CopyLimits) error {
+	var bytes int64
+	var files, symlinks int
+	err := filepath.WalkDir(src, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == ".luckyagent") {
+			return filepath.SkipDir
+		}
+		if strings.HasPrefix(entry.Name(), ".env") {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			symlinks++
+			if symlinks > limits.MaxSymlinks {
+				return fmt.Errorf("symlink count %d exceeds cap %d at %s", symlinks, limits.MaxSymlinks, rel)
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		files++
+		if files > limits.MaxFiles {
+			return fmt.Errorf("file count exceeds cap %d at %s", limits.MaxFiles, rel)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		bytes += info.Size()
+		if bytes > limits.MaxBytes {
+			return fmt.Errorf("byte size exceeds cap %d at %s", limits.MaxBytes, rel)
+		}
+		return nil
+	})
+	return err
 }
 
 func copyTree(src, dst string) error {
@@ -403,11 +492,11 @@ func (s *Snapshot) command(ctx context.Context, command, workdir string, env map
 		return cmd, nil
 	}
 	if runtime.GOOS == "windows" {
-		return nil, errors.New("iso sandbox requires bubblewrap on a Linux host")
+		return nil, errors.New("restricted sandbox requires bubblewrap on a Linux host")
 	}
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
-		return nil, fmt.Errorf("iso sandbox requires bubblewrap: %w", err)
+		return nil, fmt.Errorf("restricted sandbox requires bubblewrap: %w", err)
 	}
 	if workdir == "" {
 		workdir = s.Root

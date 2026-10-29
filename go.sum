@@ -12,6 +12,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/yurika0211/luckyagent-orchestrator v0.1.1 h1:NipscOmOyFeVe0OLD+of73kCnRjxeJWLJfou50naWzI=
 github.com/yurika0211/luckyagent-orchestrator v0.1.1/go.mod h1:2+IqqxdSrq8S3+K7ADbml705RqSsWQMGEOfADJmNSJk=
+github.com/yurika0211/luckyagent-orchestrator v0.1.2-0.20261029210738-8f7a8557a00e h1:Ti74Nb2IskqRpAWRh+U1mhnpLUduc2gFrXYeJs77WAA=
+github.com/yurika0211/luckyagent-orchestrator v0.1.2-0.20261029210738-8f7a8557a00e/go.mod h1:2+IqqxdSrq8S3+K7ADbml705RqSsWQMGEOfADJmNSJk=
 golang.org/x/sys v0.42.0 h1:omrd2nAlyT5ESRdCLYdm3+fMfNFE/+Rf4bDIQImRJeo=
 golang.org/x/sys v0.42.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=

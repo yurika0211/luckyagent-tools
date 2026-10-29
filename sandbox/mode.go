@@ -19,11 +19,12 @@ import (
 type Mode string
 
 const (
-	ModeDev Mode = "dev"
-	ModeIso Mode = "iso"
+	ModeDev            Mode = "dev"
+	ModeIso            Mode = "iso"
+	ModeWorkspaceWrite Mode = "workspace-write"
 )
 
-func (m Mode) Valid() bool { return m == ModeDev || m == ModeIso }
+func (m Mode) Valid() bool { return m == ModeDev || m == ModeIso || m == ModeWorkspaceWrite }
 
 func (m Mode) String() string {
 	if !m.Valid() {
@@ -81,7 +82,7 @@ func (m *Manager) Set(mode Mode) error {
 		return errors.New("sandbox manager is nil")
 	}
 	if !mode.Valid() {
-		return fmt.Errorf("invalid sandbox mode %q; use dev or iso", mode)
+		return fmt.Errorf("invalid sandbox mode %q; use dev, iso or workspace-write", mode)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -173,11 +174,18 @@ func (s *Snapshot) Close() {
 
 func (s *Snapshot) Isolated() bool { return s != nil && s.Mode == ModeIso }
 
+// Restricted reports modes that enforce the same tool boundary as iso. The
+// workspace-write mode keeps the original workspace but exposes it through a
+// read-only system view with network and host credentials removed.
+func (s *Snapshot) Restricted() bool {
+	return s != nil && (s.Mode == ModeIso || s.Mode == ModeWorkspaceWrite)
+}
+
 // ValidateToolArgs protects tools that do not execute inside bubblewrap. The
 // shell wrapper is not enough: file, network, GUI, and plugin tools need the
 // same task boundary enforced at the gateway.
 func (s *Snapshot) ValidateToolArgs(toolName string, args map[string]any) error {
-	if s == nil || !s.Isolated() {
+	if s == nil || !s.Restricted() {
 		return nil
 	}
 	name := strings.ToLower(strings.TrimSpace(toolName))
@@ -263,6 +271,9 @@ func Prepare(mode Mode, root string) (*Snapshot, error) {
 	}
 	if !info.IsDir() {
 		return nil, fmt.Errorf("sandbox source is not a directory: %s", root)
+	}
+	if mode == ModeWorkspaceWrite {
+		return &Snapshot{Mode: ModeWorkspaceWrite, OriginalRoot: root, Root: root}, nil
 	}
 	dest, err := os.MkdirTemp("", "luckyagent-iso-")
 	if err != nil {
@@ -414,6 +425,11 @@ func (s *Snapshot) command(ctx context.Context, command, workdir string, env map
 		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/tmp/home",
 		"--bind", s.Root, "/workspace",
 		"--chdir", filepath.Join("/workspace", mustRelative(s.Root, workdir)),
+	}
+	if s.Mode == ModeWorkspaceWrite {
+		// Keep repository metadata readable for ordinary tooling while making
+		// hooks and config under .git immutable from the sandbox.
+		args = append(args, "--ro-bind-try", filepath.Join(s.Root, ".git"), "/workspace/.git")
 	}
 	if !ephemeral {
 		args = append(args, "--clearenv")

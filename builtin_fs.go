@@ -105,7 +105,7 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 	}
 	// The dev mode is intentionally permissive for normal project work. Direct
 	// calls without an execution snapshot retain the legacy command guard.
-	if snapshot == nil || snapshot.Mode == sandbox.ModeIso {
+	if snapshot == nil || snapshot.Restricted() {
 		if err := validateShellSandbox(command); err != nil {
 			return "", err
 		}

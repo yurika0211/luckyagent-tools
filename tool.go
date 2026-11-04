@@ -374,27 +374,8 @@ func (r *Registry) ListModelVisible() []*Tool {
 
 // Call 调用工具
 func (r *Registry) Call(name string, args map[string]any) (string, error) {
-	r.mu.RLock()
-	t, name, ok := r.lookupToolLocked(name)
-	r.mu.RUnlock()
-
-	if !ok {
-		return "", ErrToolNotFound{name: name}
-	}
-	if !t.Enabled {
-		return "", ErrToolDisabled{name: name}
-	}
-
-	// 检查权限覆盖
-	perm := t.Permission
-	if override, has := r.permConf[name]; has {
-		perm = override
-	}
-	if perm == PermDeny {
-		return "", ErrToolDenied{name: name}
-	}
-
-	return t.Handler(args)
+	result, err := r.CallDetailedWithContext(name, args, ExecutionContext{Context: context.Background()})
+	return result.Output, err
 }
 
 // CallWithContext dispatches a context-aware handler and returns its text
@@ -408,26 +389,35 @@ func (r *Registry) CallDetailed(name string, args map[string]any) (ToolCallResul
 	return r.CallDetailedWithContext(name, args, ExecutionContext{Context: context.Background()})
 }
 
+// executableTool resolves a tool and applies enablement and permission checks.
+func (r *Registry) executableTool(name string) (*Tool, error) {
+	r.mu.RLock()
+	t, canonical, ok := r.lookupToolLocked(name)
+	r.mu.RUnlock()
+	if !ok {
+		return nil, ErrToolNotFound{name: name}
+	}
+	if !t.Enabled {
+		return nil, ErrToolDisabled{name: canonical}
+	}
+	perm := t.EffectivePermission(nil)
+	r.mu.RLock()
+	if override, has := r.permConf[canonical]; has {
+		perm = override
+	}
+	r.mu.RUnlock()
+	if perm == PermDeny {
+		return nil, ErrToolDenied{name: canonical}
+	}
+	return t, nil
+}
+
 // CallDetailedWithContext dispatches a tool while preserving request-local
 // context. Context-aware handlers take precedence over legacy handlers.
 func (r *Registry) CallDetailedWithContext(name string, args map[string]any, exec ExecutionContext) (ToolCallResult, error) {
-	r.mu.RLock()
-	t, name, ok := r.lookupToolLocked(name)
-	r.mu.RUnlock()
-
-	if !ok {
-		return ToolCallResult{}, ErrToolNotFound{name: name}
-	}
-	if !t.Enabled {
-		return ToolCallResult{}, ErrToolDisabled{name: name}
-	}
-
-	perm := t.Permission
-	if override, has := r.permConf[name]; has {
-		perm = override
-	}
-	if perm == PermDeny {
-		return ToolCallResult{}, ErrToolDenied{name: name}
+	t, err := r.executableTool(name)
+	if err != nil {
+		return ToolCallResult{}, err
 	}
 	if exec.Context == nil {
 		exec.Context = context.Background()
@@ -454,36 +444,8 @@ type ShellContext struct {
 // CallWithShellContext 执行工具并注入 shell 上下文
 // 对于 ShellAware 的工具，自动在 args 中注入 _cwd 和 _env
 func (r *Registry) CallWithShellContext(name string, args map[string]any, sc *ShellContext) (string, error) {
-	r.mu.RLock()
-	t, name, ok := r.lookupToolLocked(name)
-	r.mu.RUnlock()
-
-	if !ok {
-		return "", ErrToolNotFound{name: name}
-	}
-	if !t.Enabled {
-		return "", ErrToolDisabled{name: name}
-	}
-
-	// 检查权限覆盖
-	perm := t.Permission
-	if override, has := r.permConf[name]; has {
-		perm = override
-	}
-	if perm == PermDeny {
-		return "", ErrToolDenied{name: name}
-	}
-
-	// 注入 shell 上下文
-	if t.ShellAware && sc != nil {
-		if args == nil {
-			args = make(map[string]any)
-		}
-		args["_cwd"] = sc.Cwd
-		args["_env"] = sc.Env
-	}
-
-	return t.Handler(args)
+	result, err := r.CallDetailedWithShellExecutionContext(name, args, sc, ExecutionContext{Context: context.Background()})
+	return result.Output, err
 }
 
 func (r *Registry) CallDetailedWithShellContext(name string, args map[string]any, sc *ShellContext) (ToolCallResult, error) {
@@ -493,25 +455,10 @@ func (r *Registry) CallDetailedWithShellContext(name string, args map[string]any
 // CallDetailedWithShellExecutionContext combines shell injection and
 // request-local context for context-aware tools.
 func (r *Registry) CallDetailedWithShellExecutionContext(name string, args map[string]any, sc *ShellContext, exec ExecutionContext) (ToolCallResult, error) {
-	r.mu.RLock()
-	t, name, ok := r.lookupToolLocked(name)
-	r.mu.RUnlock()
-
-	if !ok {
-		return ToolCallResult{}, ErrToolNotFound{name: name}
+	t, err := r.executableTool(name)
+	if err != nil {
+		return ToolCallResult{}, err
 	}
-	if !t.Enabled {
-		return ToolCallResult{}, ErrToolDisabled{name: name}
-	}
-
-	perm := t.Permission
-	if override, has := r.permConf[name]; has {
-		perm = override
-	}
-	if perm == PermDeny {
-		return ToolCallResult{}, ErrToolDenied{name: name}
-	}
-
 	if t.ShellAware && sc != nil {
 		if args == nil {
 			args = make(map[string]any)

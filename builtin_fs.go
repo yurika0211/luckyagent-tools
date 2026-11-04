@@ -25,6 +25,7 @@ const (
 	maxFileReadLimit     = 5000
 	binarySniffBytes     = 8192
 	maxFileWriteBytes    = 25 * 1024 * 1024
+	maxFileSendBytes     = 31 << 20
 	defaultDeleteMax     = 1000
 )
 

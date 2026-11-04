@@ -98,7 +98,7 @@ func TestBuiltinToolsRegistration(t *testing.T) {
 	r := NewRegistry()
 	RegisterRuntimeBuiltinTools(r)
 
-	expected := []string{"terminal", "file_read", "document_read", "file_write", "file_mkdir", "file_move", "file_delete", "file_patch", "file_list", "web_search", "web_fetch", "opencli", "current_time", "calculate", "image", "text_to_speech", "data", "http_request", "memory", "rag_search", "rag_index"}
+	expected := []string{"terminal", "file_read", "document_read", "file_write", "file_send", "file_mkdir", "file_move", "file_delete", "file_patch", "file_list", "web_search", "web_fetch", "opencli", "current_time", "calculate", "image", "text_to_speech", "data", "http_request", "memory", "rag_search", "rag_index"}
 	for _, name := range expected {
 		tool, ok := r.Get(name)
 		if !ok {

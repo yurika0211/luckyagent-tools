@@ -121,7 +121,24 @@ text-only `ChatFunc`. `Generate` preserves user-turn boundaries, limits parallel
 calls and merges in history order. Progress callbacks are serialized. Hosts
 validate the final summary before saving their own backups/checkpoints.
 `Validate`, `LocalSummary`, `SelectInput` and `RestoreAttachments` can also be
-used independently. `workflow.NewWorkflowEngine` accepts an executor with
+used independently.
+
+`Transcript` keeps a folded message rebuildable. `TextOptions.TranscriptBudget`
+and `ToolRunes` set the caps, `SummarizeTool` is rendered as a header line
+rather than replacing the body, and `CompressTool` supplies the excerpt when
+the host has its own scorer. A message past its cap is reduced by line score:
+lines carrying a path, URL, command, error head, commit, value or diff hunk are
+kept, and blank, repeated and progress lines are dropped first. Retained lines
+keep their original order, and a folded message keeps a replay pointer (`#index`
+or `ref=`) plus an omission record naming the original line range. A protected
+line that itself exceeds the budget is kept whole and reported as over budget
+instead of being cut. `ToolCall.Arguments` is rendered and capped per call.
+`Identifiers` extracts the identifiers a summary must keep, and
+`ValidateOptions.RequiredIdentifiers` makes `Validate` fail and name any one it
+dropped; omitting it keeps the shape checks only. `ReasoningScore` is optional:
+without a scoring model reasoning is left untouched, and a block is replaced by
+`[SKIP]` only when its score is above `ReasoningSkipDelta` and it is not the
+last block of its sequence. `workflow.NewWorkflowEngine` accepts an executor with
 registered action callbacks; HTTP adapters live in `luckyagent-api/workflow`.
 
 See [compaction evidence and cancellation](docs/compaction.md) for local-fallback

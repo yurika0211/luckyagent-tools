@@ -16,9 +16,20 @@ type Message struct {
 	Name             string
 	ToolCalls        []ToolCall
 	CompactBoundary  bool
+	// Index is the message position in the session. Zero means unset, so a
+	// transcript only prints a replay pointer when the caller filled one in.
+	Index int
+	// Ref is an externalized id for a body that lives outside the transcript.
+	Ref string
 }
 
-type ToolCall struct{ Name string }
+// ToolCall is one tool invocation rendered into the transcript. Arguments is
+// optional and must already be truncated by the caller; the transcript still
+// caps it so a large JSON blob cannot come back in through this field.
+type ToolCall struct {
+	Name      string
+	Arguments string
+}
 
 type Estimator interface{ Estimate(string) int }
 type EstimatorFunc func(string) int
@@ -26,10 +37,29 @@ type EstimatorFunc func(string) int
 func (f EstimatorFunc) Estimate(text string) int { return f(text) }
 
 // TextOptions supplies application-specific tool rendering and fallback goals.
+// Every field is optional. A zero value keeps the v0.2.3 transcript shape,
+// except that a tool summary is no longer truncated twice.
 type TextOptions struct {
-	SummarizeTool     func(name, result string) string
-	FallbackGoal      string
-	MergeFallbackGoal string
+	// SummarizeTool returns one header line for a tool result. It no longer
+	// replaces the body; the body comes from CompressTool or the built-in
+	// line scorer. Returning an empty string omits the header.
+	SummarizeTool func(name, result string) string
+	// CompressTool returns the excerpt to keep for one tool result. When nil
+	// the engine scores lines itself and falls back to its own cap.
+	CompressTool func(name, result string, budget int) string
+	// TranscriptBudget overrides TranscriptMaxRunes when positive.
+	TranscriptBudget int
+	// ToolRunes overrides the per-tool cap when positive.
+	ToolRunes int
+	// ReasoningScore scores one reasoning block against the observation that
+	// followed it. The bool reports whether a scoring model is available;
+	// false skips reasoning compression entirely instead of inventing a rule.
+	ReasoningScore func(block string, prior []string, observation string) (float64, bool)
+	// ReasoningSkipDelta is the Δ(r,o) above which an observed reasoning block
+	// is replaced by [SKIP]. Zero selects the built-in threshold.
+	ReasoningSkipDelta float64
+	FallbackGoal       string
+	MergeFallbackGoal  string
 }
 
 type Attachment struct {

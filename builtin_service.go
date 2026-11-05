@@ -48,6 +48,7 @@ func (s *BuiltinToolService) RegisterTools(r *Registry) {
 	r.Register(FileReadTool(s.filesystemPolicy))
 	r.Register(DocumentReadTool(s.filesystemPolicy))
 	r.Register(FileWriteTool())
+	r.Register(FileSendTool())
 	r.Register(FileMkdirTool())
 	r.Register(FileMoveTool())
 	r.Register(FileDeleteTool())

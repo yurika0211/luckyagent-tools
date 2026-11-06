@@ -327,63 +327,63 @@ func TestCallResolvesOpenAICompatibleName(t *testing.T) {
 func TestGatewayResolvesOpenAICompatibleName(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&Tool{
-		Name:       "codex.start_thread",
+		Name:       "demo.echo",
 		Permission: PermAuto,
 		Handler: func(args map[string]any) (string, error) {
-			return "thread-created", nil
+			return "echoed", nil
 		},
 	})
 
 	// Function schemas expose the OpenAI-compatible underscore name, while
 	// the registry keeps the dotted internal name. The gateway must resolve
 	// the model-facing name before its executable and permission checks.
-	result, err := NewGateway(r).Execute("codex_start_thread", nil, "")
+	result, err := NewGateway(r).Execute("demo_echo", nil, "")
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if result.Output != "thread-created" {
-		t.Fatalf("expected thread-created, got %q", result.Output)
+	if result.Output != "echoed" {
+		t.Fatalf("expected echoed, got %q", result.Output)
 	}
 }
 
 func TestGatewaySandboxValidationResolvesOpenAICompatibleName(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&Tool{
-		Name:       "codex.start_thread",
+		Name:       "demo.echo",
 		Permission: PermAuto,
 		Handler:    func(args map[string]any) (string, error) { return "should not execute", nil },
 	})
 
-	_, err := NewGateway(r).ExecuteWithContext("codex_start_thread", map[string]any{"cwd": "/tmp"}, "", ExecutionContext{
+	_, err := NewGateway(r).ExecuteWithContext("demo_echo", map[string]any{"path": "/tmp/outside.txt"}, "", ExecutionContext{
 		Context: context.Background(),
 		Sandbox: &sandbox.Snapshot{Mode: sandbox.ModeIso, Root: t.TempDir()},
 	})
-	if err == nil || !strings.Contains(err.Error(), "codex cwd is outside iso workspace") {
-		t.Fatalf("expected aliased Codex call to be sandbox-checked, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "path is outside iso workspace") {
+		t.Fatalf("expected aliased call to be sandbox-checked, got %v", err)
 	}
 }
 
 func TestPermissionOperationsResolveOpenAICompatibleName(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&Tool{
-		Name:       "codex.start_thread",
+		Name:       "demo.echo",
 		Permission: PermAuto,
 		Handler: func(args map[string]any) (string, error) {
 			return "should not execute", nil
 		},
 	})
 
-	if err := r.SetPermissionOverride("codex_start_thread", PermDeny); err != nil {
+	if err := r.SetPermissionOverride("demo_echo", PermDeny); err != nil {
 		t.Fatalf("SetPermissionOverride: %v", err)
 	}
-	perm, err := r.CheckPermission("codex_start_thread")
+	perm, err := r.CheckPermission("demo_echo")
 	if err != nil {
 		t.Fatalf("CheckPermission: %v", err)
 	}
 	if perm != PermDeny {
 		t.Fatalf("expected deny, got %s", perm)
 	}
-	if _, err := r.Call("codex_start_thread", nil); err == nil {
+	if _, err := r.Call("demo_echo", nil); err == nil {
 		t.Fatal("expected aliased call to be denied")
 	} else if _, ok := err.(ErrToolDenied); !ok {
 		t.Fatalf("expected ErrToolDenied, got %T", err)

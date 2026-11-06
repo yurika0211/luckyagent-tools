@@ -60,11 +60,11 @@ Unconfigured callbacks keep their existing unavailable-service responses.
 | `sandbox` | Execution mode, task snapshots, path checks and isolated shell commands |
 | `opencli` | Host-independent OpenCLI configuration DTO |
 | `textutil` | Shared text, HTML and URL formatting helpers |
-| Root runtime services | Memory/RAG handlers, delegation/autonomy tool adapters, cron/heartbeat tools, media/computer tools, temporary credential tools and coding-agent bridges |
+| Root runtime services | Memory/RAG handlers, delegation/autonomy tool adapters, cron/heartbeat tools, media/computer tools and temporary credential tools |
 | `memory`, `rag`, `credentials`, `chat` | Neutral backend ports, shared data and credential identifier validation |
 | `task`, `collab`, `autonomy` | Deprecated compatibility aliases to the independent `luckyagent-orchestrator` engines |
 | `cron` | Generic scheduled job engine |
-| `computer`, `multimodal`, `codex`, `grok` | Optional desktop/media providers and external coding-agent clients |
+| `computer`, `multimodal` | Optional desktop and media providers |
 | `approval`, `hitl` | Neutral approval values and runtime-scoped human approval/input waits |
 | `skillroute` | Matching immutable skill descriptions to natural-language requests |
 | `execpolicy` | Turn-local intent constraints and tool-call decisions using the task policy decision contract |

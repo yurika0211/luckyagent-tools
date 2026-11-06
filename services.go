@@ -18,14 +18,12 @@ type Services struct {
 	Autonomy          *AutonomyToolService
 	Heartbeat         *HeartbeatToolService
 	Skills            *SkillToolService
-	Codex             *CodexToolService
-	Grok              *GrokToolService
 	Ephemeral         *EphemeralCredentialToolService
 	EphemeralTerminal *EphemeralCredentialTerminalToolService
 }
 
-// Close releases optional long-lived tool runtimes such as Codex App Server
-// and the Grok agent process.
+// Close releases optional long-lived tool runtimes such as ephemeral
+// credential sessions.
 func (s *Services) Close() error {
 	if s == nil {
 		return nil
@@ -38,16 +36,6 @@ func (s *Services) Close() error {
 	}
 	if s.EphemeralTerminal != nil {
 		if err := s.EphemeralTerminal.Close(); err != nil && first == nil {
-			first = err
-		}
-	}
-	if s.Codex != nil {
-		if err := s.Codex.Close(); err != nil && first == nil {
-			first = err
-		}
-	}
-	if s.Grok != nil {
-		if err := s.Grok.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -119,12 +107,6 @@ func (s *Services) RegisterCoreTools(r *Registry) {
 	}
 	if s.Skills != nil {
 		s.Skills.RegisterSkillTools(r)
-	}
-	if s.Codex != nil {
-		s.Codex.RegisterTools(r)
-	}
-	if s.Grok != nil {
-		s.Grok.RegisterTools(r)
 	}
 	if s.Ephemeral != nil {
 		s.Ephemeral.RegisterTools(r)

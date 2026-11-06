@@ -163,24 +163,6 @@ func (g *Guard) BlockReason(call Call) string {
 				return "the user requested delegate task inspection without changing tasks"
 			}
 		}
-	case "codex.start_turn", "codex.steer_turn":
-		if g.mutationBlocked() {
-			return "the user requested a read-only/no-file-modification task"
-		}
-	case "codex.respond_approval":
-		decision := strings.ToLower(StringArg(args, "decision"))
-		if (decision == "accept" || decision == "acceptforsession") && g.mutationBlocked() {
-			return "the user requested a read-only/no-file-modification task"
-		}
-	case "grok.start_turn":
-		if g.mutationBlocked() {
-			return "the user requested a read-only/no-file-modification task"
-		}
-	case "grok.respond_approval":
-		decision := strings.ToLower(StringArg(args, "decision"))
-		if (decision == "allow" || decision == "allow_always" || decision == "allow-always") && g.mutationBlocked() {
-			return "the user requested a read-only/no-file-modification task"
-		}
 	}
 
 	if strings.HasPrefix(name, "skill_") && strings.HasSuffix(name, "_run") && g.noSkillRun {

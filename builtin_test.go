@@ -1370,6 +1370,31 @@ func TestShellTimeoutClamp(t *testing.T) {
 	}
 }
 
+func TestShellTimeoutErrorNamesHardLimitOnlyWhenClamped(t *testing.T) {
+	clamped := shellTimeoutError(5000, clampShellTimeout(5000))
+	if clamped == nil {
+		t.Fatal("expected clamp timeout error")
+	}
+	text := clamped.Error()
+	for _, want := range []string{"900", "requested 5000", "hard limit"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("clamped error %q missing %q", text, want)
+		}
+	}
+
+	for _, requested := range []int{30, 900} {
+		err := shellTimeoutError(requested, clampShellTimeout(requested))
+		text := err.Error()
+		if strings.Contains(text, "hard limit") || strings.Contains(text, "requested") {
+			t.Fatalf("timeout %d should not mention the clamp: %s", requested, text)
+		}
+		want := fmt.Sprintf("command timed out after %d seconds", requested)
+		if text != want {
+			t.Fatalf("timeout %d error = %q, want %q", requested, text, want)
+		}
+	}
+}
+
 func TestSandboxDenialNamesReadRootConfig(t *testing.T) {
 	err := validateSandboxForOperation("/definitely/not/in/sandbox", filesystemRead, DefaultFilesystemPolicy())
 	if err == nil {

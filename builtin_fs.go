@@ -84,7 +84,7 @@ func TerminalTool() *Tool {
 		ParallelSafe: false,
 		Parameters: map[string]Param{
 			"command": {Type: "string", Description: "Concrete terminal command to run. Prefer precise inspection or execution commands over exploratory one-liners.", Required: true},
-			"timeout": {Type: "number", Description: "Timeout in seconds (default 30, max 900). Long builds and tests should pass this explicitly.", Required: false, Default: 30},
+			"timeout": {Type: "number", Description: "Timeout in seconds (default 30, max 900). Long builds and tests should pass this explicitly. Waits longer than 900s are clamped; poll in short steps instead of one long sleep.", Required: false, Default: 30},
 			"workdir": {Type: "string", Description: "Optional working directory. Use when the command must run in a specific project or subdirectory.", Required: false},
 		},
 		Handler: handleShell,
@@ -115,7 +115,8 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 		return "", shellFileReadRedirectError(toolName, path)
 	}
 
-	timeout := clampShellTimeout(shellTimeoutArg(args))
+	requested := shellTimeoutArg(args)
+	timeout := clampShellTimeout(requested)
 
 	cwd, _ := args["_cwd"].(string)
 	env, _ := args["_env"].(map[string]string)
@@ -177,7 +178,7 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 	case <-time.After(ctx):
 		killShellProcessGroup(cmd)
 		<-done
-		return "", fmt.Errorf("command timed out after %d seconds", timeout)
+		return "", shellTimeoutError(requested, timeout)
 	}
 }
 
@@ -202,6 +203,16 @@ func clampShellTimeout(timeout int) int {
 		return 900
 	}
 	return timeout
+}
+
+// shellTimeoutError reports the timeout that was actually enforced. A request
+// above the 900s cap still runs for 900s, and the error names both numbers so
+// the caller does not treat the clamp as a still-running command.
+func shellTimeoutError(requested, clamped int) error {
+	if requested > 900 {
+		return fmt.Errorf("command timed out after %d seconds (hard limit %d; requested %d)", clamped, 900, requested)
+	}
+	return fmt.Errorf("command timed out after %d seconds", clamped)
 }
 
 func shellEnvPrefix(env map[string]string, goos string) string {

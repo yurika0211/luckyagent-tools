@@ -227,7 +227,7 @@ func handleShellOutput(args map[string]any) (string, error) {
 	if strings.TrimSpace(id) == "" {
 		return "", fmt.Errorf("task_id is required")
 	}
-	return shellBackgroundWait(id, shellTimeoutArg(args))
+	return shellBackgroundWait(id, shellOutputWaitArg(args))
 }
 
 func handleShellKill(args map[string]any) (string, error) {

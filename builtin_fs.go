@@ -220,6 +220,37 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 	}
 }
 
+// shellOutputWaitArg is the terminal_output wait. Omitted and 0 snapshot
+// immediately. A positive value waits that many seconds and does not kill.
+func shellOutputWaitArg(args map[string]any) int {
+	if args == nil {
+		return 0
+	}
+	raw, ok := args["timeout"]
+	if !ok || raw == nil {
+		return 0
+	}
+	switch v := raw.(type) {
+	case float64:
+		if v <= 0 {
+			return 0
+		}
+		return int(v)
+	case int:
+		if v <= 0 {
+			return 0
+		}
+		return v
+	case int64:
+		if v <= 0 {
+			return 0
+		}
+		return int(v)
+	default:
+		return 0
+	}
+}
+
 func shellTimeoutArg(args map[string]any) int {
 	timeout := 30
 	if t, ok := args["timeout"]; ok {

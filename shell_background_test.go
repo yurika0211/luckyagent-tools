@@ -95,6 +95,42 @@ func TestBackgroundWaitDoesNotKill(t *testing.T) {
 	}
 }
 
+func TestOmittedTerminalOutputTimeoutSnapshots(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group signals are unix-only")
+	}
+	t.Cleanup(resetShellBackgroundTasks)
+
+	out, err := handleShell(map[string]any{"command": "sleep 30", "background": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := taskIDFromOutput(out)
+	start := time.Now()
+	snap, err := handleShellOutput(map[string]any{"task_id": id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("omitted timeout waited %s", time.Since(start))
+	}
+	if !strings.Contains(snap, "state=running") {
+		t.Fatalf("snapshot = %q", snap)
+	}
+	if got := shellOutputWaitArg(nil); got != 0 {
+		t.Fatalf("nil args wait = %d", got)
+	}
+	if got := shellOutputWaitArg(map[string]any{}); got != 0 {
+		t.Fatalf("omitted wait = %d", got)
+	}
+	if got := shellOutputWaitArg(map[string]any{"timeout": 0}); got != 0 {
+		t.Fatalf("zero wait = %d", got)
+	}
+	if got := shellOutputWaitArg(map[string]any{"timeout": float64(4)}); got != 4 {
+		t.Fatalf("positive wait = %d", got)
+	}
+}
+
 func taskIDFromOutput(out string) string {
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "task_id=") {

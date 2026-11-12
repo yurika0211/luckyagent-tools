@@ -84,8 +84,9 @@ func TerminalTool() *Tool {
 		ParallelSafe: false,
 		Parameters: map[string]Param{
 			"command": {Type: "string", Description: "Concrete terminal command to run. Prefer precise inspection or execution commands over exploratory one-liners.", Required: true},
-			"timeout": {Type: "number", Description: "Timeout in seconds (default 30, max 900). Long builds and tests should pass this explicitly. Waits longer than 900s are clamped; poll in short steps instead of one long sleep.", Required: false, Default: 30},
-			"workdir": {Type: "string", Description: "Optional working directory. Use when the command must run in a specific project or subdirectory.", Required: false},
+			"timeout": {Type: "number", Description: "Foreground wait in seconds (default 30, max 900). Long builds and tests should pass this explicitly. Waits longer than 900s are clamped. Ignored when background is true: a background command is not killed on timeout.", Required: false, Default: 30},
+			"workdir":    {Type: "string", Description: "Optional working directory. Use when the command must run in a specific project or subdirectory.", Required: false},
+			"background": {Type: "boolean", Description: "When true, start the command and return task_id immediately. The process keeps running. Read it with terminal_output and stop it with terminal_kill. Default false.", Required: false, Default: false},
 		},
 		Handler: handleShell,
 		ContextDetailedHandler: func(exec ExecutionContext, args map[string]any) (ToolCallResult, error) {
@@ -97,6 +98,44 @@ func TerminalTool() *Tool {
 
 func handleShell(args map[string]any) (string, error) {
 	return handleShellWithSandbox(nil, args)
+}
+
+// TerminalOutputTool snapshots a background terminal task. timeout is the
+// optional wait in seconds. Zero returns the current output. A positive wait
+// returns when the process exits or the wait elapses, and does not kill it.
+func TerminalOutputTool() *Tool {
+	return &Tool{
+		Name:         "terminal_output",
+		Description:  "Read output from a background terminal task started with terminal background=true. Pass timeout seconds to wait up to that long. A task that is still running is left running.",
+		Category:     CatBuiltin,
+		Source:       "builtin",
+		Permission:   PermApprove,
+		ShellAware:   false,
+		ParallelSafe: true,
+		Parameters: map[string]Param{
+			"task_id": {Type: "string", Description: "task_id returned by a background terminal command.", Required: true},
+			"timeout": {Type: "number", Description: "Seconds to wait for the task to exit. 0 or omitted returns the current snapshot and does not kill a running task.", Required: false, Default: 0},
+		},
+		Handler: handleShellOutput,
+	}
+}
+
+// TerminalKillTool stops a background terminal task. It sends SIGTERM, then
+// SIGKILL if the process is still alive after one second.
+func TerminalKillTool() *Tool {
+	return &Tool{
+		Name:         "terminal_kill",
+		Description:  "Stop a background terminal task. Sends SIGTERM, then SIGKILL if it is still running.",
+		Category:     CatBuiltin,
+		Source:       "builtin",
+		Permission:   PermApprove,
+		ShellAware:   false,
+		ParallelSafe: false,
+		Parameters: map[string]Param{
+			"task_id": {Type: "string", Description: "task_id returned by a background terminal command.", Required: true},
+		},
+		Handler: handleShellKill,
+	}
 }
 
 func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (string, error) {
@@ -117,6 +156,7 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 
 	requested := shellTimeoutArg(args)
 	timeout := clampShellTimeout(requested)
+	background := shellBoolArg(args, "background")
 
 	cwd, _ := args["_cwd"].(string)
 	env, _ := args["_env"].(map[string]string)
@@ -134,6 +174,10 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 			prefix = shellEnvPrefix(env, runtime.GOOS)
 		}
 		fullCommand = prefix + command
+	}
+
+	if background {
+		return shellBackgroundStart(snapshot, args, command, fullCommand, workdir, env)
 	}
 
 	ctx := time.Duration(timeout) * time.Second
@@ -164,15 +208,9 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 
 	select {
 	case err := <-done:
-		output := stdout.String()
-		if stderr.Len() > 0 {
-			output += "\n[stderr]\n" + stderr.String()
-		}
-		if err != nil {
-			output += fmt.Sprintf("\n[exit code: %v]", err)
-		}
-		if len(output) > 10000 {
-			output = output[:10000] + "\n... (truncated)"
+		output := formatShellOutput(stdout.String(), stderr.String(), err)
+		if len(output) > shellBackgroundOutputLimit {
+			output = output[:shellBackgroundOutputLimit] + "\n... (truncated)"
 		}
 		return output, nil
 	case <-time.After(ctx):

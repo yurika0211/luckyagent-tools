@@ -11,6 +11,8 @@ func RegisterBuiltinTools(r *Registry) {
 func RegisterBuiltinToolsWithConfig(r *Registry, searchCfg *WebSearchConfig, opencliCfg *OpenCLIConfig) {
 	policy := DefaultFilesystemPolicy()
 	r.Register(TerminalTool())
+	r.Register(TerminalOutputTool())
+	r.Register(TerminalKillTool())
 	r.Register(FileReadTool(policy))
 	r.Register(DocumentReadTool(policy))
 	r.Register(FileWriteTool())

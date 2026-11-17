@@ -2,14 +2,22 @@ package compact
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
 	"errors"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"unicode/utf8"
 )
+
+//go:embed testdata/ledger-16699.txt
+var ledgerFixture embed.FS
+
+// ledgerFixtureSHA256 is the SHA-256 of the published synthetic ledger body
+// (16699 runes, 37883 bytes). The file is that body only.
+const ledgerFixtureSHA256 = "459b77dcd660e97e4d674181d6d4c22a6bdbb43d7b2a637622c392a13233a40d"
 
 // The 1800-rune case is the published minimal repro: one synthetic path in the
 // middle of a user message, under TranscriptMaxRunes.
@@ -290,16 +298,20 @@ func runeSuffixPrefix(prev, part []rune, n int) bool {
 
 func loadLedgerFixture(t *testing.T) string {
 	t.Helper()
-	const path = "/tmp/luckyagent-compact-e2e-fixture-20261117.json"
-	raw, err := os.ReadFile(path)
+	raw, err := ledgerFixture.ReadFile("testdata/ledger-16699.txt")
 	if err != nil {
-		t.Fatalf("read fixture: %v", err)
+		t.Fatalf("embedded ledger fixture missing: %v", err)
 	}
-	var doc struct {
-		LedgerUserMessage string `json:"ledger_user_message"`
+	if len(raw) != 37883 {
+		t.Fatalf("ledger fixture bytes=%d, want 37883", len(raw))
 	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("decode fixture: %v", err)
+	sum := sha256.Sum256(raw)
+	if hex.EncodeToString(sum[:]) != ledgerFixtureSHA256 {
+		t.Fatalf("ledger fixture hash changed: %x", sum)
 	}
-	return doc.LedgerUserMessage
+	text := string(raw)
+	if utf8.RuneCountInString(text) != 16699 {
+		t.Fatalf("ledger fixture runes=%d, want 16699", utf8.RuneCountInString(text))
+	}
+	return text
 }

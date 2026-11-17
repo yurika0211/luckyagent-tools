@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"unicode/utf8"
 )
@@ -114,7 +115,7 @@ func TestEngineSeesMiddleFactsAcrossChunkWindows(t *testing.T) {
 	}
 	est := EstimatorFunc(func(text string) int { return (utf8.RuneCountInString(text) + 3) / 4 })
 	chunks := SplitChunks([]Message{{Role: "user", Content: body}}, est, 3000)
-	if stitched := stitchWindows(chunks); stitched != body {
+	if stitched := joinWindowContent(chunks); stitched != body {
 		t.Fatalf("windows do not cover the source: got %d runes, want %d", utf8.RuneCountInString(stitched), utf8.RuneCountInString(body))
 	}
 	for _, prompt := range prompts {
@@ -260,19 +261,92 @@ func TestPathThatFitsIsNotCutAtChunkBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("n=%d err=%v", n, err)
 		}
+		if joinWindowContent(chunks) != body {
+			t.Fatalf("n=%d windows are not a direct cover of the source", n)
+		}
 		holders := 0
 		for _, chunk := range chunks {
-			if strings.Contains(chunk[0].Content, path) {
+			content := chunk[0].Content
+			if strings.Contains(content, path) {
 				holders++
 			}
-			if contentTokens(est, chunk[0].Content) > budget {
-				t.Fatalf("n=%d window tokens=%d budget=%d", n, contentTokens(est, chunk[0].Content), budget)
+			if pathFragment(content, path) {
+				t.Fatalf("n=%d residual path window: %q", n, truncate(content, 80))
+			}
+			if contentTokens(est, content) > contentTokenBudget(budget) {
+				t.Fatalf("n=%d window tokens=%d room=%d", n, contentTokens(est, content), contentTokenBudget(budget))
 			}
 		}
-		if holders < 1 {
-			t.Fatalf("n=%d path runes=%d fit in budget %d but no window held it", n, utf8.RuneCountInString(path), budget)
+		if holders != 1 {
+			t.Fatalf("n=%d complete path windows=%d, want 1", n, holders)
 		}
 	}
+}
+
+func TestReview136RunePathUsesTwoWindowsAndThreeCalls(t *testing.T) {
+	path := "/" + strings.Repeat("seg/", 30) + "batch-19.ndjson"
+	if utf8.RuneCountInString(path) != 136 {
+		t.Fatalf("path runes=%d, want 136", utf8.RuneCountInString(path))
+	}
+	body := strings.Repeat("x", 180) + " " + path + " " + strings.Repeat("y", 40)
+	if utf8.RuneCountInString(body) != 358 {
+		t.Fatalf("body runes=%d, want 358", utf8.RuneCountInString(body))
+	}
+	est := EstimatorFunc(func(text string) int { return utf8.RuneCountInString(text) })
+	chunks, err := SplitChunksChecked([]Message{{Role: "user", Content: body}}, est, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("windows=%d, want 2", len(chunks))
+	}
+	if joinWindowContent(chunks) != body {
+		t.Fatal("windows do not join to the source")
+	}
+	wantLens := []int{181, 177}
+	for i, chunk := range chunks {
+		content := chunk[0].Content
+		if utf8.RuneCountInString(content) != wantLens[i] {
+			t.Fatalf("window %d runes=%d, want %d", i, utf8.RuneCountInString(content), wantLens[i])
+		}
+		if contentTokens(est, content) > contentTokenBudget(200) {
+			t.Fatalf("window %d exceeds room", i)
+		}
+		if pathFragment(content, path) {
+			t.Fatalf("window %d is a path fragment", i)
+		}
+	}
+	joined := chunks[0][0].Content + chunks[1][0].Content
+	if strings.Count(joined, path) != 1 || !strings.Contains(chunks[1][0].Content, path) {
+		t.Fatal("path is not whole in the second window only")
+	}
+	var segment, merge atomic.Int32
+	engine := New(Config{
+		MaxChunkTokens: 200,
+		Estimator:      est,
+		Chat: func(_ context.Context, request ChatRequest) (string, error) {
+			switch request.Kind {
+			case "segment":
+				segment.Add(1)
+				if pathFragment(request.UserPrompt, path) {
+					t.Error("segment prompt contains a path fragment")
+				}
+			case "merge":
+				merge.Add(1)
+			}
+			return testSummary("continue"), nil
+		},
+	})
+	if _, _, genErr := engine.Generate(context.Background(), []Message{{Role: "user", Content: body}}); genErr != nil {
+		t.Fatal(genErr)
+	}
+	if segment.Load() != 2 || merge.Load() != 1 {
+		t.Fatalf("segment=%d merge=%d, want 2 and 1", segment.Load(), merge.Load())
+	}
+}
+
+func pathFragment(content, path string) bool {
+	return strings.Contains(content, path[:8]) && !strings.Contains(content, path)
 }
 
 func TestUnsplittableProseRefusesBeforeChat(t *testing.T) {
@@ -311,69 +385,25 @@ func TestSplitKeepsToolCallPairedAndBoundedOverlap(t *testing.T) {
 		if len(chunk) != 1 || len(chunk[0].ToolCalls) != 1 || chunk[0].ToolCalls[0].Name != "read" {
 			t.Fatalf("chunk %d detached the tool call", i)
 		}
-		if contentTokens(est, chunk[0].Content) > 2000 {
+		if contentTokens(est, chunk[0].Content) > contentTokenBudget(2000) {
 			t.Fatalf("chunk %d tokens=%d", i, contentTokens(est, chunk[0].Content))
 		}
 		covered += utf8.RuneCountInString(chunk[0].Content)
 	}
-	// Overlap copies are bounded by the fixed overlap, not by a detected span.
-	extra := covered - len([]rune(body))
-	maxExtra := (len(chunks) - 1) * ChunkOverlapRunes
-	if extra > maxExtra {
-		t.Fatalf("overlap extra=%d max=%d", extra, maxExtra)
+	if covered != utf8.RuneCountInString(body) {
+		t.Fatalf("windows runes=%d source=%d", covered, utf8.RuneCountInString(body))
 	}
 }
 
-// stitchWindows joins chunk windows on their fixed overlap. The longest
-// suffix/prefix match at or below ChunkOverlapRunes is the copied edge.
-func stitchWindows(chunks [][]Message) string {
-	var out []rune
-	var prev []rune
-	for i, chunk := range chunks {
+func joinWindowContent(chunks [][]Message) string {
+	var b strings.Builder
+	for _, chunk := range chunks {
 		if len(chunk) != 1 {
 			return ""
 		}
-		part := []rune(chunk[0].Content)
-		if i == 0 {
-			out = append(out, part...)
-			prev = part
-			continue
-		}
-		k := ChunkOverlapRunes
-		if k > len(prev) {
-			k = len(prev)
-		}
-		if k > len(part) {
-			k = len(part)
-		}
-		found := -1
-		for n := k; n >= 0; n-- {
-			if runeSuffixPrefix(prev, part, n) {
-				found = n
-				break
-			}
-		}
-		if found < 0 {
-			return ""
-		}
-		out = append(out, part[found:]...)
-		prev = part
+		b.WriteString(chunk[0].Content)
 	}
-	return string(out)
-}
-
-func runeSuffixPrefix(prev, part []rune, n int) bool {
-	if n == 0 {
-		return true
-	}
-	a := prev[len(prev)-n:]
-	b := part[:n]
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return b.String()
 }
 
 func loadLedgerFixture(t *testing.T) string {

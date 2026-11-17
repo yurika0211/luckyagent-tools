@@ -17,14 +17,10 @@ func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Mess
 	return chunks
 }
 
-// ChunkOverlapRunes is how many runes a later window repeats from the previous
-// cut, and only when that repeat still fits the token budget. It is not a
-// minimum window and it is not grown to swallow an unsplittable span.
-const ChunkOverlapRunes = 128
-
 // splitOversizedChunkMessages breaks one oversized message on whitespace or
-// punctuation. A continuous span that itself exceeds the chunk token budget
-// is left intact and marked with ErrTranscriptBudget by SplitChunksChecked.
+// sentence punctuation. Windows do not overlap: the next window starts where
+// the previous one ended. A continuous span that itself exceeds the chunk
+// token budget is left intact and reported by SplitChunksChecked.
 // Several messages in one chunk stay together: the turn split already ran.
 func splitOversizedChunkMessages(chunks [][]Message, est Estimator, maxChunkTokens int) [][]Message {
 	out, err := splitOversizedChunkMessagesChecked(chunks, est, maxChunkTokens)
@@ -121,105 +117,69 @@ func splitOversizedChunkMessagesChecked(chunks [][]Message, est Estimator, maxCh
 			continue
 		}
 		for _, part := range parts {
-			window := []Message{part}
-			// The +4 message frame in EstimateMessage is not text. Reject only
-			// when the body itself exceeds the caller's token budget.
-			if contentTokens(est, part.Content) > maxChunkTokens {
+			if contentTokens(est, part.Content) > contentTokenBudget(maxChunkTokens) {
 				return chunks, fmt.Errorf("%w", ErrTranscriptBudget)
 			}
-			out = append(out, window)
+			out = append(out, []Message{part})
 		}
 	}
 	return out, nil
 }
 
+// splitMessageWindows packs separator-free spans in order. The next window
+// starts at the previous end. A span is never cut. Role, name, and tool calls
+// are copied onto every window; only Content changes.
 func splitMessageWindows(msg Message, maxChunkTokens int, est Estimator) ([]Message, error) {
 	runes := []rune(msg.Content)
 	if len(runes) == 0 {
 		return []Message{msg}, nil
 	}
+	room := contentTokenBudget(maxChunkTokens)
 	if unsplittableSpanOverBudget(runes, maxChunkTokens, est) {
 		return nil, fmt.Errorf("%w", ErrTranscriptBudget)
 	}
 	var parts []Message
 	start := 0
 	for start < len(runes) {
-		end := fitWindowEnd(runes, start, maxChunkTokens, est)
+		end := greedyWindowEnd(runes, start, room, est)
 		if end <= start {
 			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
 		}
 		part := msg
 		part.Content = string(runes[start:end])
-		if contentTokens(est, part.Content) > contentTokenBudget(maxChunkTokens) {
+		if contentTokens(est, part.Content) > room || utf8.RuneCountInString(part.Content) > room {
 			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
 		}
 		parts = append(parts, part)
-		if end >= len(runes) {
-			break
-		}
-		next := end
-		if overlap := overlapRunes(est, maxChunkTokens, string(runes[start:end])); overlap > 0 && end-overlap > start {
-			next = end - overlap
-		}
-		if next <= start {
-			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
-		}
-		start = next
+		start = end
 	}
 	return parts, nil
 }
 
-// fitWindowEnd returns the largest end in (start, len] whose slice fits the
-// token budget. When the raw budget cut lands inside a continuous span, the
-// cut moves back to the span start if that span still fits in a later window.
-// The cut is never moved forward past the budget.
-func fitWindowEnd(runes []rune, start, maxChunkTokens int, est Estimator) int {
-	lo, hi := start+1, len(runes)
-	best := start
-	for lo <= hi {
-		mid := (lo + hi) / 2
-		if estimateRange(est, runes[start:mid]) <= contentTokenBudget(maxChunkTokens) {
-			best = mid
-			lo = mid + 1
+// greedyWindowEnd takes whole spans and the separators between them until the
+// next span would pass the room. It returns start when even one span does not
+// fit. It never returns an index inside a span.
+func greedyWindowEnd(runes []rune, start, room int, est Estimator) int {
+	end := start
+	i := start
+	for i < len(runes) {
+		next := i
+		if isSpanSeparator(runes[i]) {
+			for next < len(runes) && isSpanSeparator(runes[next]) {
+				next++
+			}
 		} else {
-			hi = mid - 1
+			for next < len(runes) && !isSpanSeparator(runes[next]) {
+				next++
+			}
 		}
+		if estimateRange(est, runes[start:next]) > room || next-start > room {
+			break
+		}
+		end = next
+		i = next
 	}
-	if best <= start {
-		return start
-	}
-	if best >= len(runes) {
-		return len(runes)
-	}
-	spanStart := continuousSpanStart(runes, best)
-	if spanStart > start && estimateRange(est, runes[start:spanStart]) <= contentTokenBudget(maxChunkTokens) && estimateRange(est, runes[start:spanStart]) > 0 {
-		return spanStart
-	}
-	return best
-}
-
-// continuousSpanStart is the start of the separator-free span that contains
-// index. Separators are whitespace and punctuation, including CJK punctuation.
-// Letters, digits, and marks stay inside the span, so a path or a long word
-// is one span.
-func continuousSpanStart(runes []rune, index int) int {
-	if index <= 0 {
-		return 0
-	}
-	if index > len(runes) {
-		index = len(runes)
-	}
-	i := index
-	if i == len(runes) || isSpanSeparator(runes[i]) {
-		i--
-	}
-	for i > 0 && !isSpanSeparator(runes[i]) {
-		i--
-	}
-	if isSpanSeparator(runes[i]) {
-		return i + 1
-	}
-	return i
+	return end
 }
 
 func isSpanSeparator(r rune) bool {
@@ -274,25 +234,6 @@ func contentTokens(est Estimator, text string) int {
 	n := est.Estimate(text)
 	if n < 0 {
 		return 0
-	}
-	return n
-}
-
-// overlapRunes repeats up to ChunkOverlapRunes, but only while the next
-// window can still hold that repeat inside the token budget. A zero result
-// means the next window starts at the cut.
-func overlapRunes(est Estimator, maxChunkTokens int, window string) int {
-	runes := []rune(window)
-	n := ChunkOverlapRunes
-	if n > len(runes) {
-		n = len(runes)
-	}
-	for n > 0 && estimateRange(est, runes[len(runes)-n:]) >= contentTokenBudget(maxChunkTokens) {
-		n--
-	}
-	// Keep one rune of progress even when the overlap would consume the window.
-	if n >= len(runes) {
-		return len(runes) - 1
 	}
 	return n
 }

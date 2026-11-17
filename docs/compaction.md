@@ -12,12 +12,11 @@ middle of a message stays in the input. Tool result bodies keep their own
 excerpt cap and replay pointer. That cap is the externalized-dump contract.
 
 `Generate` calls `SplitChunksChecked` before `Transcript`. A single message
-that is still over the chunk token budget is cut on whitespace or punctuation.
-The cut moves back to the start of a continuous span when that span fits in
-the budget, so a path is not sliced and then repaired. `ChunkOverlapRunes`
-(128) may be repeated only while the next window still fits the token budget,
-and each window still advances. A continuous span that itself exceeds the
-chunk budget, including a long separator-free prose run, returns
+that is still over the chunk token budget is packed in order on whitespace or
+sentence punctuation. Each window takes whole spans until the next span would
+pass the content room (`maxChunkTokens-4`). The next window starts at that
+end. Windows do not overlap and a span is never cut. A continuous span that
+itself exceeds the room, including a long separator-free prose run, returns
 `ErrTranscriptBudget` before any model call. The original message is left
 whole. This does not raise the budget and does not promise to compact
 unbounded input. `SplitChunks` keeps the old signature and returns the unsplit

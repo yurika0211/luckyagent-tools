@@ -38,6 +38,16 @@ const (
 // summarizer still gets a full budget, and fails fast if the parent is already
 // canceled (user abort / process shutdown).
 func SummaryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return summaryContext(ctx, SummaryTimeout)
+}
+
+// summaryContext applies budget with the same cancel rules as SummaryContext.
+// A non-positive budget falls back to SummaryTimeout. A parent deadline shorter
+// than this budget is extended, but an explicit parent cancel still aborts.
+func summaryContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if budget <= 0 {
+		budget = SummaryTimeout
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -48,11 +58,11 @@ func SummaryContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	}
 	base := ctx
 	if deadline, ok := ctx.Deadline(); ok {
-		if time.Until(deadline) < SummaryTimeout {
+		if time.Until(deadline) < budget {
 			base = context.WithoutCancel(ctx)
 		}
 	}
-	summary, cancel := context.WithTimeout(base, SummaryTimeout)
+	summary, cancel := context.WithTimeout(base, budget)
 	// Extending a short deadline must not detach an explicit user cancellation.
 	stop := context.AfterFunc(ctx, func() {
 		if ctx.Err() == context.Canceled {

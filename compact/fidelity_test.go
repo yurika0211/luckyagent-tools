@@ -146,8 +146,8 @@ func TestEngineSeesRealFixtureWithoutCuttingIt(t *testing.T) {
 func TestEngineOverBudgetInputIsChunkedBeforeTranscript(t *testing.T) {
 	// Two long user messages. Each fits one transcript; together they do not.
 	// The engine must show both middles to the summarizer, not drop the first.
-	one := strings.Repeat("a", 30000) + " FIRST-DATE 2026-04-17 " + strings.Repeat("b", 30000)
-	two := strings.Repeat("c", 30000) + " SECOND-REVOKE 旧承运决定已撤销 " + strings.Repeat("d", 30000)
+	one := strings.Repeat("a ", 30000) + "FIRST-DATE 2026-04-17 " + strings.Repeat("b ", 30000)
+	two := strings.Repeat("c ", 30000) + "SECOND-REVOKE 旧承运决定已撤销 " + strings.Repeat("d ", 30000)
 	var mu sync.Mutex
 	var prompts []string
 	engine := New(Config{
@@ -218,9 +218,89 @@ func TestToolExcerptContractStillBoundsDumps(t *testing.T) {
 	}
 }
 
+func TestReview346RunePathIsNotSplitIntoModelCalls(t *testing.T) {
+	// Independent review counterexample: 1 rune = 1 token, maxChunkTokens=200.
+	// The path has no separator and is 346 runes, so no 200-token window can
+	// hold it. Generate must not call the model on the pieces.
+	path := "/synthetic/" + strings.Repeat("seg/", 80) + "batch-19.ndjson"
+	if utf8.RuneCountInString(path) != 346 {
+		t.Fatalf("path runes=%d, want 346", utf8.RuneCountInString(path))
+	}
+	body := strings.Repeat("x", 500) + path + strings.Repeat("y", 500)
+	est := EstimatorFunc(func(text string) int { return utf8.RuneCountInString(text) })
+	chunks, err := SplitChunksChecked([]Message{{Role: "user", Content: body}}, est, 200)
+	if !errors.Is(err, ErrTranscriptBudget) {
+		t.Fatalf("checked split err=%v chunks=%d", err, len(chunks))
+	}
+	calls := 0
+	engine := New(Config{
+		MaxChunkTokens: 200,
+		Estimator:      est,
+		Chat: func(context.Context, ChatRequest) (string, error) {
+			calls++
+			return testSummary("should-not-run"), nil
+		},
+	})
+	_, _, genErr := engine.Generate(context.Background(), []Message{{Role: "user", Content: body}})
+	if !errors.Is(genErr, ErrTranscriptBudget) {
+		t.Fatalf("generate err=%v", genErr)
+	}
+	if calls != 0 {
+		t.Fatalf("model calls=%d, want 0", calls)
+	}
+}
+
+func TestPathThatFitsIsNotCutAtChunkBoundary(t *testing.T) {
+	for _, n := range []int{200, 350, 500} {
+		path := "/synthetic/" + strings.Repeat("p", n) + "/batch-19.ndjson"
+		body := strings.Repeat("左段 ", 80) + path + " " + strings.Repeat("右段 ", 80)
+		est := EstimatorFunc(func(text string) int { return utf8.RuneCountInString(text) })
+		budget := utf8.RuneCountInString(path) + 32
+		chunks, err := SplitChunksChecked([]Message{{Role: "user", Content: body}}, est, budget)
+		if err != nil {
+			t.Fatalf("n=%d err=%v", n, err)
+		}
+		holders := 0
+		for _, chunk := range chunks {
+			if strings.Contains(chunk[0].Content, path) {
+				holders++
+			}
+			if contentTokens(est, chunk[0].Content) > budget {
+				t.Fatalf("n=%d window tokens=%d budget=%d", n, contentTokens(est, chunk[0].Content), budget)
+			}
+		}
+		if holders < 1 {
+			t.Fatalf("n=%d path runes=%d fit in budget %d but no window held it", n, utf8.RuneCountInString(path), budget)
+		}
+	}
+}
+
+func TestUnsplittableProseRefusesBeforeChat(t *testing.T) {
+	// A long natural-language run with no space or punctuation cannot be cut
+	// without hiding part of it. The whole source stays unsplit and no model
+	// call is made. This is not a promise to compact unbounded input.
+	body := strings.Repeat("甲", 400)
+	calls := 0
+	engine := New(Config{
+		MaxChunkTokens: 120,
+		Estimator:      EstimatorFunc(func(text string) int { return utf8.RuneCountInString(text) }),
+		Chat: func(context.Context, ChatRequest) (string, error) {
+			calls++
+			return "", nil
+		},
+	})
+	_, _, err := engine.Generate(context.Background(), []Message{{Role: "user", Content: body}})
+	if !errors.Is(err, ErrTranscriptBudget) || calls != 0 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+	if got := Transcript([]Message{{Role: "user", Content: body}}, TextOptions{}); !strings.Contains(got, body) {
+		t.Fatal("direct transcript dropped the unsplittable prose while it still fit the global budget")
+	}
+}
+
 func TestSplitKeepsToolCallPairedAndBoundedOverlap(t *testing.T) {
 	est := EstimatorFunc(func(text string) int { return (utf8.RuneCountInString(text) + 3) / 4 })
-	body := strings.Repeat("段", 20000)
+	body := strings.Repeat("段 ", 20000)
 	msg := Message{Role: "user", Content: body, ToolCalls: []ToolCall{{Name: "read", Arguments: `{"path":"/synthetic/example/required-entry.ndjson"}`}}}
 	chunks := SplitChunks([]Message{msg}, est, 2000)
 	if len(chunks) < 2 {
@@ -231,8 +311,8 @@ func TestSplitKeepsToolCallPairedAndBoundedOverlap(t *testing.T) {
 		if len(chunk) != 1 || len(chunk[0].ToolCalls) != 1 || chunk[0].ToolCalls[0].Name != "read" {
 			t.Fatalf("chunk %d detached the tool call", i)
 		}
-		if EstimateMessages(est, chunk) > 2000+ChunkOverlapRunes {
-			t.Fatalf("chunk %d tokens=%d", i, EstimateMessages(est, chunk))
+		if contentTokens(est, chunk[0].Content) > 2000 {
+			t.Fatalf("chunk %d tokens=%d", i, contentTokens(est, chunk[0].Content))
 		}
 		covered += utf8.RuneCountInString(chunk[0].Content)
 	}

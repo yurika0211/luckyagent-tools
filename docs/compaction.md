@@ -11,14 +11,19 @@ length is not applied first, so a date, amount, or revocation sentence in the
 middle of a message stays in the input. Tool result bodies keep their own
 excerpt cap and replay pointer. That cap is the externalized-dump contract.
 
-`Generate` calls `SplitChunks` before `Transcript`. A single message that is
-still over the chunk token budget is cut into ordered rune windows with a
-fixed overlap of `ChunkOverlapRunes` (128). The window is not extended to
-cover a detected span. Each window is rendered whole. If a window still does
-not fit, `Generate` returns `ErrTranscriptBudget` and does not summarize a
-shortened transcript as the whole source. A direct `Transcript` call on an
-oversized slice still returns bounded text and names the omission; that text
-is not a successful whole-source summary.
+`Generate` calls `SplitChunksChecked` before `Transcript`. A single message
+that is still over the chunk token budget is cut on whitespace or punctuation.
+The cut moves back to the start of a continuous span when that span fits in
+the budget, so a path is not sliced and then repaired. `ChunkOverlapRunes`
+(128) may be repeated only while the next window still fits the token budget,
+and each window still advances. A continuous span that itself exceeds the
+chunk budget, including a long separator-free prose run, returns
+`ErrTranscriptBudget` before any model call. The original message is left
+whole. This does not raise the budget and does not promise to compact
+unbounded input. `SplitChunks` keeps the old signature and returns the unsplit
+turn in that case. A direct `Transcript` call on an oversized slice still
+returns bounded text and names the omission; that text is not a successful
+whole-source summary.
 
 The host keeps required-fact checks, net-benefit checks, and usage accounting.
 This package does not decide which prose facts are required.

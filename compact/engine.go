@@ -57,7 +57,10 @@ func (e *Engine) Generate(ctx context.Context, messages []Message) (string, stri
 	}
 	est := e.cfg.Estimator
 	maxChunkTokens, maxParallel := e.cfg.MaxChunkTokens, e.cfg.MaxParallel
-	chunks := SplitChunks(messages, est, maxChunkTokens)
+	chunks, err := SplitChunksChecked(messages, est, maxChunkTokens)
+	if err != nil {
+		return "", "", fmt.Errorf("compact session: %w", err)
+	}
 	if err := chunksFitTranscript(chunks, e.cfg.Text); err != nil {
 		return "", "", err
 	}

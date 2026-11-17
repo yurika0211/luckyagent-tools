@@ -1,8 +1,53 @@
 package compact
 
-import "unicode/utf8"
+import (
+	"fmt"
+	"unicode"
+	"unicode/utf8"
+)
 
+// SplitChunks keeps the historical signature. An unsplittable span comes back
+// as the original turn chunk; SplitChunksChecked reports ErrTranscriptBudget
+// for that case. Generate uses the checked form and does not call the model.
 func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Message {
+	chunks, err := SplitChunksChecked(messages, est, maxChunkTokens)
+	if err != nil {
+		return splitTurnChunks(messages, est, maxChunkTokens)
+	}
+	return chunks
+}
+
+// ChunkOverlapRunes is how many runes a later window repeats from the previous
+// cut, and only when that repeat still fits the token budget. It is not a
+// minimum window and it is not grown to swallow an unsplittable span.
+const ChunkOverlapRunes = 128
+
+// splitOversizedChunkMessages breaks one oversized message on whitespace or
+// punctuation. A continuous span that itself exceeds the chunk token budget
+// is left intact and marked with ErrTranscriptBudget by SplitChunksChecked.
+// Several messages in one chunk stay together: the turn split already ran.
+func splitOversizedChunkMessages(chunks [][]Message, est Estimator, maxChunkTokens int) [][]Message {
+	out, err := splitOversizedChunkMessagesChecked(chunks, est, maxChunkTokens)
+	if err != nil {
+		// SplitChunks keeps its [][]Message result. The unsplittable message
+		// is returned whole so Generate can reject it before any model call.
+		return chunks
+	}
+	return out
+}
+
+// SplitChunksChecked is SplitChunks plus the unsplittable-span error.
+// Generate uses it. A nil error means every returned window fits maxChunkTokens
+// and no continuous span was cut. Callers of SplitChunks keep the old signature.
+func SplitChunksChecked(messages []Message, est Estimator, maxChunkTokens int) ([][]Message, error) {
+	if maxChunkTokens <= 0 {
+		maxChunkTokens = DefaultMaxChunkTokens
+	}
+	chunks := splitTurnChunks(messages, est, maxChunkTokens)
+	return splitOversizedChunkMessagesChecked(chunks, est, maxChunkTokens)
+}
+
+func splitTurnChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Message {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -12,7 +57,6 @@ func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Mess
 	if EstimateMessages(est, messages) <= maxChunkTokens {
 		return [][]Message{append([]Message(nil), messages...)}
 	}
-
 	turnStarts := make([]int, 0, len(messages)/2+1)
 	for i, msg := range messages {
 		if msg.Role == "user" {
@@ -35,14 +79,12 @@ func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Mess
 		if EstimateMessages(est, candidate) <= maxChunkTokens {
 			continue
 		}
-		// Flush everything before this turn when the running chunk overflowed.
 		prevEnd := turnStarts[t]
 		if prevEnd > chunkStart {
 			chunks = append(chunks, append([]Message(nil), messages[chunkStart:prevEnd]...))
 			chunkStart = prevEnd
 			candidate = messages[chunkStart:turnEnd]
 		}
-		// Single turn still over budget: emit it alone and continue.
 		if EstimateMessages(est, candidate) > maxChunkTokens {
 			chunks = append(chunks, append([]Message(nil), candidate...))
 			chunkStart = turnEnd
@@ -54,23 +96,12 @@ func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Mess
 	if len(chunks) == 0 {
 		return [][]Message{append([]Message(nil), messages...)}
 	}
-	return splitOversizedChunkMessages(chunks, est, maxChunkTokens)
+	return chunks
 }
 
-// ChunkOverlapRunes is the fixed overlap between windows of one oversized
-// message. It is not extended to cover a detected span. A fact longer than
-// this overlap can sit in one window; a fact that straddles the cut is copied
-// into the next window only for these runes.
-const ChunkOverlapRunes = 128
-
-// splitOversizedChunkMessages breaks a message that is still over the chunk
-// token budget into ordered rune windows. A chunk that holds several messages
-// is left whole: SplitChunks already isolated an oversized turn before this
-// step. Tool calls travel with every window of that message so a call stays
-// paired with the body slice. The added input is only the overlap copies.
-func splitOversizedChunkMessages(chunks [][]Message, est Estimator, maxChunkTokens int) [][]Message {
+func splitOversizedChunkMessagesChecked(chunks [][]Message, est Estimator, maxChunkTokens int) ([][]Message, error) {
 	if maxChunkTokens <= 0 {
-		return chunks
+		return chunks, nil
 	}
 	var out [][]Message
 	for _, chunk := range chunks {
@@ -78,94 +109,192 @@ func splitOversizedChunkMessages(chunks [][]Message, est Estimator, maxChunkToke
 			out = append(out, chunk)
 			continue
 		}
-		parts := splitMessageWindows(chunk[0], maxChunkTokens, est)
+		parts, err := splitMessageWindows(chunk[0], maxChunkTokens, est)
+		if err != nil {
+			return chunks, err
+		}
 		if len(parts) <= 1 {
+			if EstimateMessages(est, chunk) > maxChunkTokens {
+				return chunks, fmt.Errorf("%w", ErrTranscriptBudget)
+			}
 			out = append(out, chunk)
 			continue
 		}
 		for _, part := range parts {
-			out = append(out, []Message{part})
+			window := []Message{part}
+			// The +4 message frame in EstimateMessage is not text. Reject only
+			// when the body itself exceeds the caller's token budget.
+			if contentTokens(est, part.Content) > maxChunkTokens {
+				return chunks, fmt.Errorf("%w", ErrTranscriptBudget)
+			}
+			out = append(out, window)
 		}
 	}
-	return out
+	return out, nil
 }
 
-func splitMessageWindows(msg Message, maxChunkTokens int, est Estimator) []Message {
+func splitMessageWindows(msg Message, maxChunkTokens int, est Estimator) ([]Message, error) {
 	runes := []rune(msg.Content)
-	window := chunkRuneWindow(msg.Content, maxChunkTokens, est)
-	if window >= len(runes) || len(runes) == 0 {
-		return []Message{msg}
+	if len(runes) == 0 {
+		return []Message{msg}, nil
 	}
-	if window < ChunkOverlapRunes*2 {
-		window = ChunkOverlapRunes * 2
+	if unsplittableSpanOverBudget(runes, maxChunkTokens, est) {
+		return nil, fmt.Errorf("%w", ErrTranscriptBudget)
 	}
 	var parts []Message
-	for start := 0; start < len(runes); {
-		end := start + window
-		if end > len(runes) {
-			end = len(runes)
-		} else if snapped := snapWindowEnd(runes, start, end); snapped > start {
-			end = snapped
+	start := 0
+	for start < len(runes) {
+		end := fitWindowEnd(runes, start, maxChunkTokens, est)
+		if end <= start {
+			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
 		}
 		part := msg
 		part.Content = string(runes[start:end])
+		if contentTokens(est, part.Content) > contentTokenBudget(maxChunkTokens) {
+			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
+		}
 		parts = append(parts, part)
 		if end >= len(runes) {
 			break
 		}
-		next := end - ChunkOverlapRunes
+		next := end
+		if overlap := overlapRunes(est, maxChunkTokens, string(runes[start:end])); overlap > 0 && end-overlap > start {
+			next = end - overlap
+		}
 		if next <= start {
-			next = start + 1
+			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
 		}
 		start = next
 	}
-	return parts
+	return parts, nil
 }
 
-// snapWindowEnd moves a cut back to a newline inside the fixed overlap.
-// The window only shrinks. A line longer than ChunkOverlapRunes can still
-// be split; the overlap then carries that many runes into the next window.
-func snapWindowEnd(runes []rune, start, end int) int {
-	searchFrom := end - ChunkOverlapRunes
-	if searchFrom < start {
-		searchFrom = start
-	}
-	for i := end - 1; i >= searchFrom; i-- {
-		if runes[i] == '\n' {
-			return i + 1
+// fitWindowEnd returns the largest end in (start, len] whose slice fits the
+// token budget. When the raw budget cut lands inside a continuous span, the
+// cut moves back to the span start if that span still fits in a later window.
+// The cut is never moved forward past the budget.
+func fitWindowEnd(runes []rune, start, maxChunkTokens int, est Estimator) int {
+	lo, hi := start+1, len(runes)
+	best := start
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if estimateRange(est, runes[start:mid]) <= contentTokenBudget(maxChunkTokens) {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
 		}
 	}
-	return end
+	if best <= start {
+		return start
+	}
+	if best >= len(runes) {
+		return len(runes)
+	}
+	spanStart := continuousSpanStart(runes, best)
+	if spanStart > start && estimateRange(est, runes[start:spanStart]) <= contentTokenBudget(maxChunkTokens) && estimateRange(est, runes[start:spanStart]) > 0 {
+		return spanStart
+	}
+	return best
 }
 
-// chunkRuneWindow converts a token budget into runes using the same estimator
-// the chunker used. The result never exceeds TranscriptMaxRunes, so one window
-// cannot hand Transcript an unbounded message. It is not grown to fit a span.
-func chunkRuneWindow(content string, maxChunkTokens int, est Estimator) int {
-	runes := utf8.RuneCountInString(content)
-	window := TranscriptMaxRunes
-	if est != nil && runes > 0 {
-		tokens := est.Estimate(content)
-		if tokens > 0 {
-			room := maxChunkTokens - 4
-			if room < 1 {
-				room = 1
-			}
-			window = runes * room / tokens
+// continuousSpanStart is the start of the separator-free span that contains
+// index. Separators are whitespace and punctuation, including CJK punctuation.
+// Letters, digits, and marks stay inside the span, so a path or a long word
+// is one span.
+func continuousSpanStart(runes []rune, index int) int {
+	if index <= 0 {
+		return 0
+	}
+	if index > len(runes) {
+		index = len(runes)
+	}
+	i := index
+	if i == len(runes) || isSpanSeparator(runes[i]) {
+		i--
+	}
+	for i > 0 && !isSpanSeparator(runes[i]) {
+		i--
+	}
+	if isSpanSeparator(runes[i]) {
+		return i + 1
+	}
+	return i
+}
+
+func isSpanSeparator(r rune) bool {
+	if unicode.IsSpace(r) {
+		return true
+	}
+	// Sentence punctuation only. Slash, hyphen, dot and underscore stay inside
+	// a path, a date, or an amount, so those tokens are one span.
+	switch r {
+	case '。', '！', '？', '；', '，', '、', ',', '!', '?', ';', ':', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\'', '`':
+		return true
+	default:
+		return false
+	}
+}
+
+// unsplittableSpanOverBudget reports a separator-free span whose own token
+// estimate exceeds the chunk budget. Splitting it would hide the span from
+// every window.
+func unsplittableSpanOverBudget(runes []rune, maxChunkTokens int, est Estimator) bool {
+	start := 0
+	for i := 0; i <= len(runes); i++ {
+		if i < len(runes) && !isSpanSeparator(runes[i]) {
+			continue
 		}
-	} else if maxChunkTokens > 0 && maxChunkTokens < window {
-		window = maxChunkTokens
+		if i > start && estimateRange(est, runes[start:i]) > contentTokenBudget(maxChunkTokens) {
+			return true
+		}
+		start = i + 1
 	}
-	// Leave room for the role label so the rendered line still fits
-	// TranscriptMaxRunes. The window is not grown past this cap.
-	const transcriptFrameRunes = 256
-	if window > TranscriptMaxRunes-transcriptFrameRunes {
-		window = TranscriptMaxRunes - transcriptFrameRunes
+	return false
+}
+
+func estimateRange(est Estimator, runes []rune) int {
+	return contentTokens(est, string(runes))
+}
+
+// contentTokenBudget is the token room for message text. EstimateMessage adds
+// 4 for the message frame; that frame is not part of the span.
+func contentTokenBudget(maxChunkTokens int) int {
+	room := maxChunkTokens - 4
+	if room < 1 {
+		room = 1
 	}
-	if window < 1 {
-		window = 1
+	return room
+}
+
+func contentTokens(est Estimator, text string) int {
+	if est == nil {
+		return utf8.RuneCountInString(text)
 	}
-	return window
+	n := est.Estimate(text)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// overlapRunes repeats up to ChunkOverlapRunes, but only while the next
+// window can still hold that repeat inside the token budget. A zero result
+// means the next window starts at the cut.
+func overlapRunes(est Estimator, maxChunkTokens int, window string) int {
+	runes := []rune(window)
+	n := ChunkOverlapRunes
+	if n > len(runes) {
+		n = len(runes)
+	}
+	for n > 0 && estimateRange(est, runes[len(runes)-n:]) >= contentTokenBudget(maxChunkTokens) {
+		n--
+	}
+	// Keep one rune of progress even when the overlap would consume the window.
+	if n >= len(runes) {
+		return len(runes) - 1
+	}
+	return n
 }
 
 func SelectInput(raw []Message, est Estimator, retainTurns, targetTailTokens int) ([]Message, []Message) {

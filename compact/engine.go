@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -186,13 +187,25 @@ func (e *Engine) merge(ctx context.Context, summaries []string) (string, error) 
 	return e.invoke(ctx, ChatRequest{UserPrompt: MergePrompt(body, e.cfg.AgentName), Kind: "merge", Units: len(summaries), TranscriptRunes: utf8.RuneCountInString(body)})
 }
 
+func (e *Engine) summaryBudget(request ChatRequest) time.Duration {
+	if e == nil || e.cfg.SummaryBudget == nil {
+		return SummaryTimeout
+	}
+	budget := e.cfg.SummaryBudget(request)
+	if budget <= 0 {
+		return SummaryTimeout
+	}
+	return budget
+}
+
 func (e *Engine) invoke(ctx context.Context, request ChatRequest) (string, error) {
-	sumCtx, cancel := SummaryContext(ctx)
+	budget := e.summaryBudget(request)
+	sumCtx, cancel := summaryContext(ctx, budget)
 	defer cancel()
 	if err := sumCtx.Err(); err != nil {
 		return "", err
 	}
-	e.cfg.Logger.Debug("compact summary request", "kind", request.Kind, "units", request.Units, "transcript_runes", request.TranscriptRunes, "model", e.cfg.Model, "timeout", SummaryTimeout.String())
+	e.cfg.Logger.Debug("compact summary request", "kind", request.Kind, "units", request.Units, "transcript_runes", request.TranscriptRunes, "model", e.cfg.Model, "timeout", budget.String())
 	request.SystemPrompt = "You are a compaction agent. Tool use is not allowed. Produce only a factual text summary for future context."
 	summary, err := e.cfg.Chat(sumCtx, request)
 	if err != nil {

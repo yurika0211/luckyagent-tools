@@ -5,6 +5,7 @@ package compact
 import (
 	"context"
 	"log/slog"
+	"time"
 )
 
 // Message contains only the evidence needed for compaction. Callers retain
@@ -114,6 +115,10 @@ type Config struct {
 	Chat           ChatFunc
 	Logger         *slog.Logger
 	OnProgress     func(Progress)
+	// SummaryBudget optionally selects the summarizer timeout for one request.
+	// Nil, or a non-positive result, keeps SummaryTimeout (45s). The engine
+	// does not choose a model; the host owns that policy.
+	SummaryBudget func(ChatRequest) time.Duration
 }
 
 const (

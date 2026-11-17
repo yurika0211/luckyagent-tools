@@ -118,6 +118,8 @@ type Config struct {
 	// SummaryBudget optionally selects the summarizer timeout for one request.
 	// Nil, or a non-positive result, keeps SummaryTimeout (45s). The engine
 	// does not choose a model; the host owns that policy.
+	// One Generate may call this concurrently for map-reduce chunks. The
+	// callback must be pure, or it must synchronize any mutable shared state.
 	SummaryBudget func(ChatRequest) time.Duration
 }
 

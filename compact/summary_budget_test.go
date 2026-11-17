@@ -61,6 +61,57 @@ func TestSummaryBudgetIsAppliedOnEveryInvoke(t *testing.T) {
 	}
 }
 
+func TestSummaryBudgetCallbackOverlapsWhenParallel(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	inFlight := 0
+	maxInFlight := 0
+	engine := New(Config{
+		MaxChunkTokens: 8,
+		MaxParallel:    2,
+		Estimator:      EstimatorFunc(func(text string) int { return len(text) }),
+		SummaryBudget: func(request ChatRequest) time.Duration {
+			if request.Kind != "segment" {
+				return time.Second
+			}
+			mu.Lock()
+			inFlight++
+			if inFlight > maxInFlight {
+				maxInFlight = inFlight
+			}
+			current := inFlight
+			mu.Unlock()
+			if current >= 2 {
+				once.Do(func() { close(release) })
+			}
+			select {
+			case <-release:
+			case <-time.After(time.Second):
+			}
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+			return time.Second
+		},
+		Chat: func(context.Context, ChatRequest) (string, error) {
+			return "Current user goal:\n- keep goal.txt\nCompleted work:\n- noted", nil
+		},
+	})
+	messages := []Message{
+		{Role: "user", Content: "keep goal.txt"},
+		{Role: "assistant", Content: "0123456789abcdef"},
+		{Role: "user", Content: "second turn keep goal.txt"},
+		{Role: "assistant", Content: "fedcba9876543210"},
+	}
+	if _, _, err := engine.Generate(context.Background(), messages); err != nil {
+		t.Fatal(err)
+	}
+	if maxInFlight < 2 {
+		t.Fatalf("segment budget callbacks did not overlap: max=%d", maxInFlight)
+	}
+}
+
 func TestSummaryBudgetNilAndNonPositiveStayAtDefault(t *testing.T) {
 	for _, name := range []string{"nil", "zero", "negative"} {
 		t.Run(name, func(t *testing.T) {

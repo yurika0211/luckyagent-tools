@@ -58,6 +58,9 @@ func (e *Engine) Generate(ctx context.Context, messages []Message) (string, stri
 	est := e.cfg.Estimator
 	maxChunkTokens, maxParallel := e.cfg.MaxChunkTokens, e.cfg.MaxParallel
 	chunks := SplitChunks(messages, est, maxChunkTokens)
+	if err := chunksFitTranscript(chunks, e.cfg.Text); err != nil {
+		return "", "", err
+	}
 	if len(chunks) <= 1 {
 		e.emit(Progress{
 			Phase:   "progress",
@@ -66,7 +69,11 @@ func (e *Engine) Generate(ctx context.Context, messages []Message) (string, stri
 			Chunk:   1,
 			Chunks:  1,
 		})
-		summary, err := e.summarize(ctx, messages)
+		input := messages
+		if len(chunks) == 1 {
+			input = chunks[0]
+		}
+		summary, err := e.summarize(ctx, input)
 		if err != nil {
 			return "", "", err
 		}
@@ -183,8 +190,52 @@ func (e *Engine) merge(ctx context.Context, summaries []string) (string, error) 
 	if strings.TrimSpace(body) == "" {
 		return "", fmt.Errorf("compact session: no segment summaries to merge")
 	}
-	body = truncateRunes(body, TranscriptMaxRunes)
+	if utf8.RuneCountInString(body) > TranscriptMaxRunes {
+		return "", fmt.Errorf("compact session: %w", ErrTranscriptBudget)
+	}
 	return e.invoke(ctx, ChatRequest{UserPrompt: MergePrompt(body, e.cfg.AgentName), Kind: "merge", Units: len(summaries), TranscriptRunes: utf8.RuneCountInString(body)})
+}
+
+// ErrTranscriptBudget means one summarizer input does not fit in
+// TranscriptMaxRunes after chunking. Generate returns it instead of summarizing
+// a head/tail cut as if that cut were the whole source.
+var ErrTranscriptBudget = fmt.Errorf("transcript exceeds budget after chunking")
+
+// chunksFitTranscript reports whether every chunk renders inside the transcript
+// budget with no omission. A chunk that Transcript would shorten is not safe
+// to summarize as a whole source.
+func chunksFitTranscript(chunks [][]Message, opts TextOptions) error {
+	budget := TranscriptMaxRunes
+	if opts.TranscriptBudget > 0 {
+		budget = opts.TranscriptBudget
+	}
+	for _, chunk := range chunks {
+		rendered := Transcript(chunk, opts)
+		if utf8.RuneCountInString(rendered) > budget || transcriptWasReduced(chunk, rendered) {
+			return fmt.Errorf("compact session: %w", ErrTranscriptBudget)
+		}
+	}
+	return nil
+}
+
+// transcriptWasReduced reports whether Transcript dropped source prose.
+// Tool excerpts are allowed to shrink: that cap is the externalized-dump
+// contract. User and assistant content must still be present in full.
+func transcriptWasReduced(messages []Message, rendered string) bool {
+	for _, msg := range messages {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role == "tool" || msg.CompactBoundary {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		if !strings.Contains(rendered, content) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) summaryBudget(request ChatRequest) time.Duration {

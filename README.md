@@ -118,7 +118,12 @@ runtime. Neither package loads configuration or executes tools.
 
 `compact.New` accepts an estimator, limits, text-rendering callbacks and a
 text-only `ChatFunc`. `Generate` preserves user-turn boundaries, limits parallel
-calls and merges in history order. Progress callbacks are serialized. Hosts
+calls and merges in history order. A message that exceeds one chunk is split
+into fixed rune windows before `Transcript` renders it. `Transcript` copies
+user and assistant text whole while the 48000-rune budget fits, and tool dumps
+stay on their excerpt cap. `ErrTranscriptBudget` is returned when a window
+still does not fit, instead of summarizing a cut as the whole source.
+Progress callbacks are serialized. Hosts
 validate the final summary before saving their own backups/checkpoints.
 `Validate`, `LocalSummary`, `SelectInput` and `RestoreAttachments` can also be
 used independently.

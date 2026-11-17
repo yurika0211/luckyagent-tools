@@ -4,6 +4,25 @@
 bounded parallelism and merges them in history order. The embedding host owns
 storage, session authorization, final validation and completion decisions.
 
+`Transcript` is one bounded summarizer input, capped at `TranscriptMaxRunes`
+(48000) unless `TextOptions.TranscriptBudget` is smaller. While that budget
+still fits, user and assistant messages are copied whole. A fixed per-role
+length is not applied first, so a date, amount, or revocation sentence in the
+middle of a message stays in the input. Tool result bodies keep their own
+excerpt cap and replay pointer. That cap is the externalized-dump contract.
+
+`Generate` calls `SplitChunks` before `Transcript`. A single message that is
+still over the chunk token budget is cut into ordered rune windows with a
+fixed overlap of `ChunkOverlapRunes` (128). The window is not extended to
+cover a detected span. Each window is rendered whole. If a window still does
+not fit, `Generate` returns `ErrTranscriptBudget` and does not summarize a
+shortened transcript as the whole source. A direct `Transcript` call on an
+oversized slice still returns bounded text and names the omission; that text
+is not a successful whole-source summary.
+
+The host keeps required-fact checks, net-benefit checks, and usage accounting.
+This package does not decide which prose facts are required.
+
 `LocalSummary` is a recovery fallback. Assistant statements are placed under
 `Uncertain facts` with an unverified label; a statement such as “I will edit the
 file” is never promoted into completed work. Tool text remains command/evidence

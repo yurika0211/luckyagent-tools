@@ -1,6 +1,49 @@
 package compact
 
+import (
+	"fmt"
+	"unicode"
+	"unicode/utf8"
+)
+
+// SplitChunks keeps the historical signature. An unsplittable span comes back
+// as the original turn chunk; SplitChunksChecked reports ErrTranscriptBudget
+// for that case. Generate uses the checked form and does not call the model.
 func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Message {
+	chunks, err := SplitChunksChecked(messages, est, maxChunkTokens)
+	if err != nil {
+		return splitTurnChunks(messages, est, maxChunkTokens)
+	}
+	return chunks
+}
+
+// splitOversizedChunkMessages breaks one oversized message on whitespace or
+// sentence punctuation. Windows do not overlap: the next window starts where
+// the previous one ended. A continuous span that itself exceeds the chunk
+// token budget is left intact and reported by SplitChunksChecked.
+// Several messages in one chunk stay together: the turn split already ran.
+func splitOversizedChunkMessages(chunks [][]Message, est Estimator, maxChunkTokens int) [][]Message {
+	out, err := splitOversizedChunkMessagesChecked(chunks, est, maxChunkTokens)
+	if err != nil {
+		// SplitChunks keeps its [][]Message result. The unsplittable message
+		// is returned whole so Generate can reject it before any model call.
+		return chunks
+	}
+	return out
+}
+
+// SplitChunksChecked is SplitChunks plus the unsplittable-span error.
+// Generate uses it. A nil error means every returned window fits maxChunkTokens
+// and no continuous span was cut. Callers of SplitChunks keep the old signature.
+func SplitChunksChecked(messages []Message, est Estimator, maxChunkTokens int) ([][]Message, error) {
+	if maxChunkTokens <= 0 {
+		maxChunkTokens = DefaultMaxChunkTokens
+	}
+	chunks := splitTurnChunks(messages, est, maxChunkTokens)
+	return splitOversizedChunkMessagesChecked(chunks, est, maxChunkTokens)
+}
+
+func splitTurnChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Message {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -10,7 +53,6 @@ func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Mess
 	if EstimateMessages(est, messages) <= maxChunkTokens {
 		return [][]Message{append([]Message(nil), messages...)}
 	}
-
 	turnStarts := make([]int, 0, len(messages)/2+1)
 	for i, msg := range messages {
 		if msg.Role == "user" {
@@ -33,14 +75,12 @@ func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Mess
 		if EstimateMessages(est, candidate) <= maxChunkTokens {
 			continue
 		}
-		// Flush everything before this turn when the running chunk overflowed.
 		prevEnd := turnStarts[t]
 		if prevEnd > chunkStart {
 			chunks = append(chunks, append([]Message(nil), messages[chunkStart:prevEnd]...))
 			chunkStart = prevEnd
 			candidate = messages[chunkStart:turnEnd]
 		}
-		// Single turn still over budget: emit it alone and continue.
 		if EstimateMessages(est, candidate) > maxChunkTokens {
 			chunks = append(chunks, append([]Message(nil), candidate...))
 			chunkStart = turnEnd
@@ -53,6 +93,149 @@ func SplitChunks(messages []Message, est Estimator, maxChunkTokens int) [][]Mess
 		return [][]Message{append([]Message(nil), messages...)}
 	}
 	return chunks
+}
+
+func splitOversizedChunkMessagesChecked(chunks [][]Message, est Estimator, maxChunkTokens int) ([][]Message, error) {
+	if maxChunkTokens <= 0 {
+		return chunks, nil
+	}
+	var out [][]Message
+	for _, chunk := range chunks {
+		if len(chunk) != 1 || EstimateMessages(est, chunk) <= maxChunkTokens {
+			out = append(out, chunk)
+			continue
+		}
+		parts, err := splitMessageWindows(chunk[0], maxChunkTokens, est)
+		if err != nil {
+			return chunks, err
+		}
+		if len(parts) <= 1 {
+			if EstimateMessages(est, chunk) > maxChunkTokens {
+				return chunks, fmt.Errorf("%w", ErrTranscriptBudget)
+			}
+			out = append(out, chunk)
+			continue
+		}
+		for _, part := range parts {
+			if contentTokens(est, part.Content) > contentTokenBudget(maxChunkTokens) {
+				return chunks, fmt.Errorf("%w", ErrTranscriptBudget)
+			}
+			out = append(out, []Message{part})
+		}
+	}
+	return out, nil
+}
+
+// splitMessageWindows packs separator-free spans in order. The next window
+// starts at the previous end. A span is never cut. Role, name, and tool calls
+// are copied onto every window; only Content changes.
+func splitMessageWindows(msg Message, maxChunkTokens int, est Estimator) ([]Message, error) {
+	runes := []rune(msg.Content)
+	if len(runes) == 0 {
+		return []Message{msg}, nil
+	}
+	room := contentTokenBudget(maxChunkTokens)
+	if unsplittableSpanOverBudget(runes, maxChunkTokens, est) {
+		return nil, fmt.Errorf("%w", ErrTranscriptBudget)
+	}
+	var parts []Message
+	start := 0
+	for start < len(runes) {
+		end := greedyWindowEnd(runes, start, room, est)
+		if end <= start {
+			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
+		}
+		part := msg
+		part.Content = string(runes[start:end])
+		if contentTokens(est, part.Content) > room || utf8.RuneCountInString(part.Content) > room {
+			return nil, fmt.Errorf("%w", ErrTranscriptBudget)
+		}
+		parts = append(parts, part)
+		start = end
+	}
+	return parts, nil
+}
+
+// greedyWindowEnd takes whole spans and the separators between them until the
+// next span would pass the room. It returns start when even one span does not
+// fit. It never returns an index inside a span.
+func greedyWindowEnd(runes []rune, start, room int, est Estimator) int {
+	end := start
+	i := start
+	for i < len(runes) {
+		next := i
+		if isSpanSeparator(runes[i]) {
+			for next < len(runes) && isSpanSeparator(runes[next]) {
+				next++
+			}
+		} else {
+			for next < len(runes) && !isSpanSeparator(runes[next]) {
+				next++
+			}
+		}
+		if estimateRange(est, runes[start:next]) > room || next-start > room {
+			break
+		}
+		end = next
+		i = next
+	}
+	return end
+}
+
+func isSpanSeparator(r rune) bool {
+	if unicode.IsSpace(r) {
+		return true
+	}
+	// Sentence punctuation only. Slash, hyphen, dot and underscore stay inside
+	// a path, a date, or an amount, so those tokens are one span.
+	switch r {
+	case '。', '！', '？', '；', '，', '、', ',', '!', '?', ';', ':', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\'', '`':
+		return true
+	default:
+		return false
+	}
+}
+
+// unsplittableSpanOverBudget reports a separator-free span whose own token
+// estimate exceeds the chunk budget. Splitting it would hide the span from
+// every window.
+func unsplittableSpanOverBudget(runes []rune, maxChunkTokens int, est Estimator) bool {
+	start := 0
+	for i := 0; i <= len(runes); i++ {
+		if i < len(runes) && !isSpanSeparator(runes[i]) {
+			continue
+		}
+		if i > start && estimateRange(est, runes[start:i]) > contentTokenBudget(maxChunkTokens) {
+			return true
+		}
+		start = i + 1
+	}
+	return false
+}
+
+func estimateRange(est Estimator, runes []rune) int {
+	return contentTokens(est, string(runes))
+}
+
+// contentTokenBudget is the token room for message text. EstimateMessage adds
+// 4 for the message frame; that frame is not part of the span.
+func contentTokenBudget(maxChunkTokens int) int {
+	room := maxChunkTokens - 4
+	if room < 1 {
+		room = 1
+	}
+	return room
+}
+
+func contentTokens(est Estimator, text string) int {
+	if est == nil {
+		return utf8.RuneCountInString(text)
+	}
+	n := est.Estimate(text)
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func SelectInput(raw []Message, est Estimator, retainTurns, targetTailTokens int) ([]Message, []Message) {

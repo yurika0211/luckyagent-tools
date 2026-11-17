@@ -19,10 +19,11 @@ const (
 	// "generate summary: context deadline exceeded" on long sessions.
 	TranscriptMaxRunes = 48_000
 
-	compactTranscriptUserRunes      = 420
-	compactTranscriptAssistantRunes = 300
-	compactTranscriptToolRunes      = 220
-	compactTranscriptDefaultRunes   = 260
+	// Tool bodies stay on this cap. User and assistant prose do not: when the
+	// joined transcript still fits TranscriptMaxRunes those messages are copied
+	// whole. A fixed 420/300 cut ran before the global budget and dropped a
+	// path, date, or decision that still fitted.
+	compactTranscriptToolRunes = 220
 
 	// compactToolArgumentRunes caps one rendered tool argument so a large JSON
 	// blob handed in through ToolCall.Arguments cannot refill the transcript.
@@ -72,13 +73,19 @@ func summaryContext(ctx context.Context, budget time.Duration) (context.Context,
 	return summary, func() { stop(); cancel() }
 }
 
-// Transcript renders session messages into a budgeted plain-text transcript for
-// the compaction summarizer. Each line is scored by how hard it would be to
-// rebuild: lines that carry a path, URL, command, error head, commit, value, or
-// diff hunk are kept, and blank, repeated, and progress lines are dropped
-// first. Retained lines stay in their original order. A folded message keeps a
-// replay pointer (its session index or external ref) so the model can point
-// back at the source instead of inventing it.
+// Transcript renders session messages into a plain-text transcript for one
+// summarizer call. It is bounded by TranscriptMaxRunes (or TextOptions.TranscriptBudget).
+// User and assistant prose is copied whole while the join still fits, so a
+// date, amount, or revocation sentence in the middle of a message survives.
+// Tool result bodies keep their own excerpt cap and replay pointer; that cap
+// is the externalized-dump contract and is not a second fact extractor.
+//
+// When the join does not fit, older rendered messages are omitted and the
+// omission is named. That result is not the whole source. Engine.Generate
+// splits oversized input before it calls Transcript, and returns
+// ErrTranscriptBudget instead of summarizing a cut transcript as if it were
+// complete. Callers that invoke Transcript directly on an oversized slice
+// still receive the bounded text.
 func Transcript(messages []Message, opts TextOptions) string {
 	budget := TranscriptMaxRunes
 	if opts.TranscriptBudget > 0 {
@@ -146,12 +153,10 @@ func formatCompactTranscriptLine(msg Message, messages []Message, position int, 
 	switch strings.ToLower(strings.TrimSpace(msg.Role)) {
 	case "tool":
 		header, content = renderToolContent(msg.Name, content, opts)
-	case "user":
-		content = fitRoleContent(content, compactTranscriptUserRunes)
-	case "assistant":
-		content = fitRoleContent(content, compactTranscriptAssistantRunes)
 	default:
-		content = fitRoleContent(content, compactTranscriptDefaultRunes)
+		// User, assistant, and other prose stay whole. The joined transcript
+		// applies the global budget once. Cutting each role first drops facts
+		// that still fit in TranscriptMaxRunes.
 	}
 
 	var b strings.Builder

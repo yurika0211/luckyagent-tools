@@ -48,6 +48,9 @@ register individual factories, use `RegisterBuiltinToolsWithConfig` for search
 and OpenCLI options, and provide callbacks to memory/RAG tool definitions.
 Unconfigured callbacks keep their existing unavailable-service responses.
 
+[Timeouts and filesystem policy](docs/timeouts-and-filesystem-policy.md) covers
+foreground/background waits, partial fetch results and explicit read/write roots.
+
 ## Ownership
 
 | Package | Responsibilities |

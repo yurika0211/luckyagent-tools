@@ -17,14 +17,15 @@ func configureShellProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
-func killShellProcessGroup(cmd *exec.Cmd) {
+func killShellProcessGroup(cmd *exec.Cmd) bool {
 	if cmd == nil || cmd.Process == nil {
-		return
+		return false
 	}
+	killed := false
 	if cmd.Process.Pid > 0 {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		killed = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) == nil
 	}
-	_ = cmd.Process.Kill()
+	return cmd.Process.Kill() == nil || killed
 }
 
 func signalShellTerm(cmd *exec.Cmd) {

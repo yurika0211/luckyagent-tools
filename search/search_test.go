@@ -1755,14 +1755,14 @@ func TestSearchWithExaMock(t *testing.T) {
 }
 
 func TestFetchWithJinaMock(t *testing.T) {
-	_, err := fetchWithJina("", "", "https://example.com", 50000)
+	_, err := fetchWithJina(context.Background(), "", "", "https://example.com", 50000)
 	if err != nil {
 		t.Logf("fetchWithJina error (expected without API key): %v", err)
 	}
 }
 
 func TestFetchWithCurlMock(t *testing.T) {
-	_, err := fetchWithCurl("", "https://example.com", 50000)
+	_, err := fetchWithCurl(context.Background(), "", "https://example.com", 50000)
 	if err != nil {
 		t.Logf("fetchWithCurl error (expected in restricted env): %v", err)
 	}
@@ -1773,14 +1773,14 @@ func TestFetchWithCurlMock(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFetchWithDefuddleNotInstalled(t *testing.T) {
-	_, err := fetchWithDefuddle("https://example.com", 50000)
+	_, err := fetchWithDefuddle(context.Background(), "https://example.com", 50000)
 	if err != nil && strings.Contains(err.Error(), "not installed") {
 		t.Logf("fetchWithDefuddle error (expected): %v", err)
 	}
 }
 
 func TestFetchWithDefuddleTruncation(t *testing.T) {
-	_, err := fetchWithDefuddle("https://example.com", 100)
+	_, err := fetchWithDefuddle(context.Background(), "https://example.com", 100)
 	if err != nil {
 		t.Logf("fetchWithDefuddle with small maxChars error: %v", err)
 	}
@@ -1791,14 +1791,14 @@ func TestFetchWithDefuddleTruncation(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFetchWithCurlWithProxy(t *testing.T) {
-	_, err := fetchWithCurl("http://proxy:3128", "https://example.com", 50000)
+	_, err := fetchWithCurl(context.Background(), "http://proxy:3128", "https://example.com", 50000)
 	if err != nil {
 		t.Logf("fetchWithCurl with proxy error (expected): %v", err)
 	}
 }
 
 func TestFetchWithCurlTooLittleContent(t *testing.T) {
-	_, err := fetchWithCurl("", "data:text/html,hi", 50000)
+	_, err := fetchWithCurl(context.Background(), "", "data:text/html,hi", 50000)
 	if err != nil {
 		t.Logf("fetchWithCurl too little content error (expected): %v", err)
 	}

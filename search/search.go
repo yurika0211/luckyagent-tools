@@ -4,6 +4,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -147,10 +148,13 @@ func (e *ExaEngine) Search(ctx context.Context, query string, count int) ([]Sear
 
 // FetchResult is the result of fetching a URL.
 type FetchResult struct {
-	Title   string
-	Content string
-	URL     string
-	Source  string // which engine produced this result
+	Title     string
+	Content   string
+	URL       string
+	Source    string // which engine produced this result
+	BytesRead int    // bytes captured before display limits: response output for curl/Jina, extractor output for defuddle
+	Partial   bool   // response ended with an error; never a complete cached page
+	Truncated bool   // intentional maxChars display limit, independently of Partial
 }
 
 // FetchEngine is the interface for a URL content extractor.
@@ -173,7 +177,7 @@ func NewDefuddleEngine() *DefuddleEngine { return &DefuddleEngine{} }
 func (e *DefuddleEngine) Name() string { return "defuddle" }
 
 func (e *DefuddleEngine) Fetch(ctx context.Context, rawURL string, maxChars int) (*FetchResult, error) {
-	return fetchWithDefuddle(rawURL, maxChars)
+	return fetchWithDefuddle(ctx, rawURL, maxChars)
 }
 
 // --- JinaEngine ---
@@ -195,7 +199,7 @@ func NewJinaEngine(apiKey, proxy string) *JinaEngine {
 func (e *JinaEngine) Name() string { return "jina" }
 
 func (e *JinaEngine) Fetch(ctx context.Context, rawURL string, maxChars int) (*FetchResult, error) {
-	return fetchWithJina(e.APIKey, e.Proxy, rawURL, maxChars)
+	return fetchWithJina(ctx, e.APIKey, e.Proxy, rawURL, maxChars)
 }
 
 // --- CurlEngine ---
@@ -211,7 +215,7 @@ func NewCurlEngine(proxy string) *CurlEngine { return &CurlEngine{Proxy: proxy} 
 func (e *CurlEngine) Name() string { return "curl" }
 
 func (e *CurlEngine) Fetch(ctx context.Context, rawURL string, maxChars int) (*FetchResult, error) {
-	return fetchWithCurl(e.Proxy, rawURL, maxChars)
+	return fetchWithCurl(ctx, e.Proxy, rawURL, maxChars)
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +336,7 @@ func (c *FetchCache) Get(rawURL string, maxChars int) (*FetchResult, bool) {
 
 // Set stores fetched content for a URL.
 func (c *FetchCache) Set(rawURL string, maxChars int, result *FetchResult) {
-	if result == nil {
+	if result == nil || result.Partial {
 		return
 	}
 	c.mu.Lock()
@@ -758,6 +762,9 @@ func (m *Manager) FetchURL(ctx context.Context, rawURL string, maxChars int) (*F
 
 // FetchURLWithDiagnostics fetches a URL and reports per-engine failures.
 func (m *Manager) FetchURLWithDiagnostics(ctx context.Context, rawURL string, maxChars int) (*FetchResult, []FetchAttempt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if maxChars <= 0 {
 		maxChars = 50000
 	}
@@ -766,30 +773,68 @@ func (m *Manager) FetchURLWithDiagnostics(ctx context.Context, rawURL string, ma
 	if err := ValidateFetchURL(rawURL); err != nil {
 		return nil, nil, fmt.Errorf("url validation failed: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 
 	if cached, ok := m.fetchCache.Get(rawURL, maxChars); ok {
 		return cached, nil, nil
 	}
 
 	var attempts []FetchAttempt
+	var partial *FetchResult
+	var lastErr error
 	for _, eng := range m.fetchEngines {
+		if err := ctx.Err(); err != nil {
+			return partial, attempts, err
+		}
 		name := eng.Name()
 		result, err := eng.Fetch(ctx, rawURL, maxChars)
-		if err == nil && result != nil && strings.TrimSpace(result.Content) != "" {
-			if strings.TrimSpace(result.Source) == "" {
-				result.Source = name
+		if result != nil && strings.TrimSpace(result.Source) == "" {
+			result.Source = name
+		}
+		// A late result is not a complete success after the caller's deadline.
+		if contextErr := ctx.Err(); contextErr != nil && !errors.Is(err, contextErr) {
+			if err == nil {
+				err = contextErr
+			} else {
+				err = fmt.Errorf("%v: %w", err, contextErr)
 			}
+		}
+		if err == nil && result != nil && result.Partial {
+			err = fmt.Errorf("%s returned an incomplete response", name)
+		}
+		if err == nil && result != nil && strings.TrimSpace(result.Content) != "" {
 			m.fetchCache.Set(rawURL, maxChars, result)
 			return result, attempts, nil
 		}
+		if result != nil && (result.BytesRead > 0 || strings.TrimSpace(result.Content) != "") {
+			result.Partial = true
+			if partial == nil || result.BytesRead > partial.BytesRead {
+				partial = result
+			}
+		}
 		if err != nil {
 			attempts = append(attempts, FetchAttempt{Engine: name, Error: err.Error()})
+			lastErr = err
 		} else {
 			attempts = append(attempts, FetchAttempt{Engine: name, Error: "empty content"})
 		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			if err == nil {
+				err = contextErr
+			}
+			return partial, attempts, err
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return partial, attempts, err
+		}
 	}
 
-	return nil, attempts, fmt.Errorf("all fetch engines failed for URL: %s", rawURL)
+	if lastErr != nil {
+		return partial, attempts, fmt.Errorf("all fetch engines failed for URL %s: %w", rawURL, lastErr)
+	}
+	return partial, attempts, fmt.Errorf("all fetch engines failed for URL: %s", rawURL)
 }
 
 // ValidateFetchURL validates a URL for safe fetching (SSRF protection).

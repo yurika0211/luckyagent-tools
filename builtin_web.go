@@ -32,13 +32,15 @@ type WebSearchConfig struct {
 }
 
 const (
-	defaultWebSearchCount   = 5
-	maxWebSearchCount       = 10
-	defaultWebFetchMaxChars = 50000
-	maxWebFetchChars        = 100000
-	defaultWebSearchFormat  = "text"
-	defaultWebFetchFormat   = "text"
-	webSearchTimeout        = 8 * time.Second
+	defaultWebSearchCount         = 5
+	maxWebSearchCount             = 10
+	defaultWebFetchMaxChars       = 50000
+	maxWebFetchChars              = 100000
+	defaultWebSearchFormat        = "text"
+	defaultWebFetchFormat         = "text"
+	webSearchTimeout              = 8 * time.Second
+	defaultWebFetchTimeoutSeconds = 30
+	maxWebFetchTimeoutSeconds     = 120
 )
 
 type webSearchOptions struct {
@@ -50,10 +52,11 @@ type webSearchOptions struct {
 }
 
 type webFetchOptions struct {
-	URL      string
-	MaxChars int
-	Format   string
-	Verbose  bool
+	URL            string
+	MaxChars       int
+	Format         string
+	Verbose        bool
+	TimeoutSeconds int
 }
 
 func defaultWebSearchConfig() *WebSearchConfig {
@@ -599,6 +602,7 @@ func WebFetchTool(cfg *WebSearchConfig) *Tool {
 			"max_chars": {Type: "number", Description: "Maximum readable text to return. Lower this when you only need a focused excerpt.", Required: false, Default: defaultWebFetchMaxChars},
 			"format":    {Type: "string", Description: "Return format: text or json.", Required: false, Default: "text"},
 			"verbose":   {Type: "boolean", Description: "Include fetch engine, URL, title, and failure diagnostics.", Required: false, Default: false},
+			"timeout":   {Type: "number", Description: "Total fetch timeout in seconds, shared by extraction and fallback engines (default 30, max 120).", Required: false, Default: defaultWebFetchTimeoutSeconds},
 		},
 		Handler:      func(args map[string]any) (string, error) { return handleWebFetch(cfg, args) },
 		ParallelSafe: true,
@@ -606,6 +610,7 @@ func WebFetchTool(cfg *WebSearchConfig) *Tool {
 }
 
 func handleWebFetch(cfg *WebSearchConfig, args map[string]any) (string, error) {
+	started := time.Now()
 	opts, err := parseWebFetchOptions(args)
 	if err != nil {
 		return "", err
@@ -615,14 +620,31 @@ func handleWebFetch(cfg *WebSearchConfig, args map[string]any) (string, error) {
 	}
 	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
 	manager := searchpkg.NewManager(buildSearchManagerConfig(cfg, provider))
-	fetchCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	fetchCtx, cancel := context.WithTimeout(context.Background(), time.Duration(opts.TimeoutSeconds)*time.Second)
 	defer cancel()
 	result, attempts, err := manager.FetchURLWithDiagnostics(fetchCtx, opts.URL, opts.MaxChars)
-	if opts.Format == "json" {
-		return formatWebFetchJSON(opts, result, attempts, err)
+	if err == nil && (result == nil || strings.TrimSpace(result.Content) == "") {
+		err = fmt.Errorf("no readable content returned for %s", opts.URL)
 	}
-	if err != nil || result == nil || strings.TrimSpace(result.Content) == "" {
-		return formatWebFetchFailure(opts.URL, attempts, opts.Verbose), nil
+	elapsed := time.Since(started)
+	if err != nil {
+		status, bytesRead, _ := webFetchOutcome(result, err)
+		err = fmt.Errorf("web_fetch failed (status=%s, timeout_seconds=%d, elapsed=%s, bytes_read=%d): %w", status, opts.TimeoutSeconds, elapsed.Round(time.Millisecond), bytesRead, err)
+	}
+	if opts.Format == "json" {
+		out, formatErr := formatWebFetchJSON(opts, result, attempts, err, elapsed)
+		if formatErr != nil {
+			return "", formatErr
+		}
+		return out, err
+	}
+	if err != nil {
+		status, bytesRead, partial := webFetchOutcome(result, err)
+		out := fmt.Sprintf("Status: %s\nTimeout-Seconds: %d\nElapsed: %s\nBytes-Read: %d\nPartial: %t\nTimed-Out: %t\nError: %s\n\n", status, opts.TimeoutSeconds, elapsed.Round(time.Millisecond), bytesRead, partial, requestTimedOut(err), err)
+		if result != nil && strings.TrimSpace(result.Content) != "" {
+			out += truncateWebFetchContent(formatFetchResult(result, result.Source == "jina"), opts.MaxChars) + "\n\n"
+		}
+		return out + formatWebFetchFailure(opts.URL, attempts, opts.Verbose), err
 	}
 	out := formatFetchResult(result, result.Source == "jina")
 	out = truncateWebFetchContent(out, opts.MaxChars)
@@ -672,7 +694,7 @@ func parseWebFetchOptions(args map[string]any) (webFetchOptions, error) {
 	if format != "text" && format != "json" {
 		return webFetchOptions{}, fmt.Errorf("unsupported web_fetch format %q (expected text or json)", format)
 	}
-	return webFetchOptions{URL: fetchURL, MaxChars: maxChars, Format: format, Verbose: mapBoolArg(args, "verbose", false)}, nil
+	return webFetchOptions{URL: fetchURL, MaxChars: maxChars, Format: format, Verbose: mapBoolArg(args, "verbose", false), TimeoutSeconds: boundedIntArg(args, "timeout", defaultWebFetchTimeoutSeconds, 1, maxWebFetchTimeoutSeconds)}, nil
 }
 
 func fetchWithDefuddle(fetchURL string, maxChars int) (string, error) {
@@ -754,11 +776,19 @@ func truncateWebFetchContent(content string, maxChars int) string {
 	return content
 }
 
-func formatWebFetchJSON(opts webFetchOptions, result *searchpkg.FetchResult, attempts []searchpkg.FetchAttempt, fetchErr error) (string, error) {
+func formatWebFetchJSON(opts webFetchOptions, result *searchpkg.FetchResult, attempts []searchpkg.FetchAttempt, fetchErr error, elapsed time.Duration) (string, error) {
+	status, bytesRead, partial := webFetchOutcome(result, fetchErr)
 	payload := map[string]any{
-		"url":       opts.URL,
-		"max_chars": opts.MaxChars,
-		"attempts":  attempts,
+		"url":             opts.URL,
+		"max_chars":       opts.MaxChars,
+		"attempts":        attempts,
+		"status":          status,
+		"partial":         partial,
+		"bytes_read":      bytesRead,
+		"timed_out":       requestTimedOut(fetchErr),
+		"timeout_seconds": opts.TimeoutSeconds,
+		"elapsed":         elapsed.Round(time.Millisecond).String(),
+		"elapsed_ms":      elapsed.Milliseconds(),
 	}
 	if result != nil {
 		content := truncateWebFetchContent(result.Content, opts.MaxChars)
@@ -766,7 +796,7 @@ func formatWebFetchJSON(opts webFetchOptions, result *searchpkg.FetchResult, att
 		payload["title"] = result.Title
 		payload["source"] = result.Source
 		payload["content"] = content
-		payload["truncated"] = len(content) != len(result.Content)
+		payload["truncated"] = result.Truncated || len(content) != len(result.Content)
 	}
 	if fetchErr != nil {
 		payload["error"] = fetchErr.Error()
@@ -776,6 +806,23 @@ func formatWebFetchJSON(opts webFetchOptions, result *searchpkg.FetchResult, att
 		return "", err
 	}
 	return string(data), nil
+}
+
+func webFetchOutcome(result *searchpkg.FetchResult, fetchErr error) (status string, bytesRead int, partial bool) {
+	if result != nil {
+		bytesRead = result.BytesRead
+		partial = result.Partial || (fetchErr != nil && (bytesRead > 0 || strings.TrimSpace(result.Content) != ""))
+	}
+	switch {
+	case partial:
+		return "partial", bytesRead, true
+	case requestTimedOut(fetchErr):
+		return "timeout", bytesRead, false
+	case fetchErr != nil:
+		return "error", bytesRead, false
+	default:
+		return "success", bytesRead, false
+	}
 }
 
 func mapBoolArg(args map[string]any, key string, def bool) bool {

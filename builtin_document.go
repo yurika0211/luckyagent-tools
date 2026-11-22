@@ -21,7 +21,7 @@ const maxDocumentReadBytes = 50 * 1024 * 1024
 
 func DocumentReadTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:         "document_read",
 		Description:  "Extract readable text from local document files such as PDF, DOCX, and PPTX. Use this instead of file_read for Office documents or PDFs.",
 		Category:     CatBuiltin,
@@ -38,6 +38,10 @@ func DocumentReadTool(policies ...FilesystemPolicy) *Tool {
 			return handleDocumentReadWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleDocumentReadWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 func handleDocumentRead(args map[string]any) (string, error) {

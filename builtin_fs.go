@@ -44,6 +44,10 @@ type FilesystemPolicy struct {
 	AllowedReadRoots    []string
 	AllowedWriteRoots   []string
 	AllowOutsideSandbox bool
+	// RestrictedRoot is populated for a task snapshot. It prevents a
+	// process-wide policy or a caller supplied _sandbox_mode from widening the
+	// filesystem boundary for this invocation.
+	RestrictedRoot string
 }
 
 func DefaultFilesystemPolicy() FilesystemPolicy {
@@ -55,6 +59,53 @@ func filesystemPolicyFromOptional(policies []FilesystemPolicy) FilesystemPolicy 
 		return DefaultFilesystemPolicy()
 	}
 	return policies[0]
+}
+
+// filesystemContextHandler adapts the legacy filesystem handlers to a
+// request-aware execution context. Filesystem tools historically captured the
+// process-wide policy at registration time, which meant an isolated task could
+// still resolve a relative path against the host session cwd when a caller
+// invoked the gateway without a ShellContext. The snapshot is authoritative
+// for that invocation, so bind both cwd and roots here.
+func filesystemContextHandler(handler func(map[string]any, FilesystemPolicy) (string, error), registered FilesystemPolicy) func(ExecutionContext, map[string]any) (ToolCallResult, error) {
+	return func(exec ExecutionContext, args map[string]any) (ToolCallResult, error) {
+		args, policy := filesystemArgsForExecution(exec, args, registered)
+		out, err := handler(args, policy)
+		return ToolCallResult{Output: out}, err
+	}
+}
+
+func filesystemArgsForExecution(exec ExecutionContext, args map[string]any, registered FilesystemPolicy) (map[string]any, FilesystemPolicy) {
+	if exec.Sandbox == nil || !exec.Sandbox.Restricted() {
+		return args, registered
+	}
+	policy := registered
+	root := filepath.Clean(exec.Sandbox.Root)
+	policy.RestrictedRoot = root
+	policy.AllowOutsideSandbox = false
+	policy.AllowedReadRoots = appendUniqueFilesystemRoot(policy.AllowedReadRoots, root)
+	policy.AllowedWriteRoots = appendUniqueFilesystemRoot(policy.AllowedWriteRoots, root)
+	if args == nil {
+		args = make(map[string]any)
+	} else {
+		clone := make(map[string]any, len(args)+2)
+		for key, value := range args {
+			clone[key] = value
+		}
+		args = clone
+	}
+	args["_cwd"] = root
+	args["_sandbox_mode"] = exec.Sandbox.Mode.String()
+	return args, policy
+}
+
+func appendUniqueFilesystemRoot(roots []string, root string) []string {
+	for _, existing := range roots {
+		if normalizeSandboxPath(existing) == normalizeSandboxPath(root) {
+			return roots
+		}
+	}
+	return append(append([]string(nil), roots...), root)
 }
 
 // AskUserTool asks the human for missing information and waits for a reply.
@@ -332,7 +383,7 @@ func shellEnvPrefix(env map[string]string, goos string) string {
 
 func FileReadTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:        "file_read",
 		Description: "Read a local file when repository or document contents are the source of truth. Prefer this before guessing about code, config, notes, or generated artifacts.",
 		Category:    CatBuiltin,
@@ -348,6 +399,10 @@ func FileReadTool(policies ...FilesystemPolicy) *Tool {
 			return handleFileReadWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleFileReadWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 func handleFileRead(args map[string]any) (string, error) {
@@ -453,7 +508,7 @@ func trimLineEnding(line string) string {
 
 func FileWriteTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:        "file_write",
 		Description: "Write a complete local file. Use dry_run=true to preview, mode=create|overwrite|upsert to control existing files, and expected_sha256 to protect against concurrent changes.",
 		Category:    CatBuiltin,
@@ -471,6 +526,10 @@ func FileWriteTool(policies ...FilesystemPolicy) *Tool {
 			return handleFileWriteWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleFileWriteWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 type fileWritePlan struct {
@@ -603,7 +662,7 @@ func sha256Hex(data []byte) string {
 
 func FileMkdirTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:        "file_mkdir",
 		Description: "Create a directory on disk. Use dry_run=true to preview the directory creation plan before changing the filesystem.",
 		Category:    CatBuiltin,
@@ -619,6 +678,10 @@ func FileMkdirTool(policies ...FilesystemPolicy) *Tool {
 			return handleFileMkdirWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleFileMkdirWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 type mkdirPlan struct {
@@ -732,7 +795,7 @@ func reverseStrings(values []string) {
 
 func FileMoveTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:        "file_move",
 		Description: "Move or rename a file or directory on disk. Use dry_run=true to preview the move plan before changing files.",
 		Category:    CatBuiltin,
@@ -749,6 +812,10 @@ func FileMoveTool(policies ...FilesystemPolicy) *Tool {
 			return handleFileMoveWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleFileMoveWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 type movePlan struct {
@@ -931,7 +998,7 @@ func copyFileThenRemove(src, dst string) error {
 
 func FileDeleteTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:        "file_delete",
 		Description: "Delete a file or directory. Use dry_run=true to preview recursive deletion, trash=true to quarantine instead of permanent deletion, and missing_ok=true to ignore absent paths.",
 		Category:    CatBuiltin,
@@ -950,6 +1017,10 @@ func FileDeleteTool(policies ...FilesystemPolicy) *Tool {
 			return handleFileDeleteWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleFileDeleteWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 type deletePlan struct {
@@ -987,6 +1058,9 @@ func handleFileDeleteWithPolicy(args map[string]any, policy FilesystemPolicy) (s
 	trash := false
 	if v, ok := args["trash"].(bool); ok {
 		trash = v
+	}
+	if trash && policy.RestrictedRoot != "" {
+		return "", fmt.Errorf("trash is unavailable in restricted sandbox; delete or move the path inside %s", policy.RestrictedRoot)
 	}
 	maxEntries := boundedIntArg(args, "max_entries", defaultDeleteMax, 1, int(^uint(0)>>1))
 
@@ -1138,7 +1212,7 @@ func entrySuffix(count int) string {
 
 func FilePatchTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:        "file_patch",
 		Description: "Apply an in-place edit to an existing text file. Supports dry_run preview, expected_sha256 protection, exact replacement, and line-oriented diff hunks.",
 		Category:    CatBuiltin,
@@ -1159,6 +1233,10 @@ func FilePatchTool(policies ...FilesystemPolicy) *Tool {
 			return handleFilePatchWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleFilePatchWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 type filePatchPlan struct {
@@ -1477,7 +1555,7 @@ func directoryWord(count int) string {
 
 func FileListTool(policies ...FilesystemPolicy) *Tool {
 	policy := filesystemPolicyFromOptional(policies)
-	return &Tool{
+	t := &Tool{
 		Name:        "file_list",
 		Description: "List files or directories when you need repository structure, candidate files, or navigation context before reading or editing specific paths.",
 		Category:    CatBuiltin,
@@ -1492,6 +1570,10 @@ func FileListTool(policies ...FilesystemPolicy) *Tool {
 			return handleFileListWithPolicy(args, policy)
 		},
 	}
+	t.ContextDetailedHandler = filesystemContextHandler(func(args map[string]any, policy FilesystemPolicy) (string, error) {
+		return handleFileListWithPolicy(args, policy)
+	}, policy)
+	return t
 }
 
 func handleFileList(args map[string]any) (string, error) {
@@ -1611,7 +1693,10 @@ func resolveReadPathArg(args map[string]any, key string, policy FilesystemPolicy
 
 func filesystemPolicyFromArgs(args map[string]any, policy FilesystemPolicy) FilesystemPolicy {
 	mode, _ := args["_sandbox_mode"].(string)
-	if strings.EqualFold(strings.TrimSpace(mode), "dev") {
+	// A restricted execution context sets RestrictedRoot and owns the mode.
+	// Never let user/model supplied metadata widen that policy back to host
+	// paths by claiming dev mode.
+	if policy.RestrictedRoot == "" && strings.EqualFold(strings.TrimSpace(mode), "dev") {
 		policy.AllowOutsideSandbox = true
 	}
 	return policy

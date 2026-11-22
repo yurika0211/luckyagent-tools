@@ -2,6 +2,7 @@ package tool
 
 import (
 	"archive/zip"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yurika0211/luckyagent-tools/sandbox"
 )
 
 func TestCurrentTimeTool(t *testing.T) {
@@ -1238,6 +1241,59 @@ func sandboxExternalTestRoot(t *testing.T) string {
 		}
 	}
 	return t.TempDir()
+}
+
+func TestRestrictedFilesystemHandlersBindSnapshotRoot(t *testing.T) {
+	root := sandboxExternalTestRoot(t)
+	outside := sandboxExternalTestRoot(t)
+	if err := os.WriteFile(filepath.Join(root, "inside.txt"), []byte("inside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "outside.txt"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &sandbox.Snapshot{Mode: sandbox.ModeWorkspaceWrite, Root: root, OriginalRoot: root}
+	exec := ExecutionContext{Context: context.Background(), Sandbox: snapshot}
+
+	read := FileReadTool()
+	result, err := read.ContextDetailedHandler(exec, map[string]any{"path": "inside.txt", "_sandbox_mode": "dev"})
+	if err != nil || !strings.Contains(result.Output, "inside") {
+		t.Fatalf("restricted relative read failed: output=%q err=%v", result.Output, err)
+	}
+	if _, err := read.ContextDetailedHandler(exec, map[string]any{"path": filepath.Join(outside, "outside.txt")}); err == nil {
+		t.Fatal("restricted read escaped snapshot root")
+	}
+
+	write := FileWriteTool()
+	if _, err := write.ContextDetailedHandler(exec, map[string]any{"path": "created.txt", "content": "ok", "_sandbox_mode": "dev"}); err != nil {
+		t.Fatalf("restricted relative write failed: %v", err)
+	}
+	if _, err := write.ContextDetailedHandler(exec, map[string]any{"path": filepath.Join(outside, "escaped.txt"), "content": "no"}); err == nil {
+		t.Fatal("restricted write escaped snapshot root")
+	}
+	if _, err := FileDeleteTool().ContextDetailedHandler(exec, map[string]any{"path": "inside.txt", "trash": true}); err == nil {
+		t.Fatal("restricted delete moved a file to the host trash")
+	}
+}
+
+func TestRestrictedFilesystemHandlersRejectSymlinkEscape(t *testing.T) {
+	root := sandboxExternalTestRoot(t)
+	outside := sandboxExternalTestRoot(t)
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	snapshot := &sandbox.Snapshot{Mode: sandbox.ModeWorkspaceWrite, Root: root, OriginalRoot: root}
+	_, err := FileWriteTool().ContextDetailedHandler(ExecutionContext{Context: context.Background(), Sandbox: snapshot}, map[string]any{
+		"path":    filepath.Join("link", "new.txt"),
+		"content": "escape",
+	})
+	if err == nil {
+		t.Fatal("restricted write followed a symlink outside snapshot root")
+	}
 }
 
 func TestFileReadAllowsConfiguredReadRoot(t *testing.T) {

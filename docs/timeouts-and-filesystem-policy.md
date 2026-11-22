@@ -80,8 +80,24 @@ shell control flow. Command substitution/backticks make the entire command
 opaque to the literal scanner; complex `cd` control flow cannot establish a
 guaranteed base for subsequent relative redirects. Windows checks explicit
 cwd only, leaving PowerShell syntax to the existing executor. These are
-preflight checks, not an OS jail. The existing sandbox launcher and its
-restricted root are unchanged; issue #26 is outside this batch.
+preflight checks, not an OS jail.
+
+## Restricted task snapshots
+
+`iso` and `workspace-write` snapshots bind every built-in filesystem tool to
+the snapshot root for the lifetime of the request. This includes calls made
+without a `ShellContext`, relative paths, write/patch/move/delete operations,
+and document reads. A caller-supplied `_sandbox_mode=dev` cannot widen a
+restricted request. Host trash is disabled in a restricted snapshot because it
+would move data outside the managed root. Symlink ancestors are resolved
+before the policy check; a path that reaches outside the snapshot is denied.
+
+This still does not claim that the whole LuckyAgent process is jailed. MCP,
+plugins, skills and other non-filesystem tools are separately disabled by the
+Agent policy in restricted modes, while terminal is the only operation
+executed inside bubblewrap. A restricted file denial means the filesystem
+boundary was enforced by tool policy, not that a kernel-level OS jail covers
+every process in the turn.
 
 ## Verification
 

@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -345,7 +346,13 @@ func (sr *SkillRegistry) Register(name string) error {
 				meta.Error = err.Error()
 				return fmt.Errorf("build skill tool %s: %w", fullName, err)
 			}
-			tool := newSkillToolFromDef(info, toolDef, handler)
+			var contextHandler func(context.Context, map[string]any) (string, error)
+			if toolDef.Handler == nil {
+				contextHandler = func(ctx context.Context, args map[string]any) (string, error) {
+					return defaultSkillHandlerContext(ctx, toolDef, info.Dir, info.Name, args)
+				}
+			}
+			tool := newSkillToolFromDefWithContext(info, toolDef, handler, contextHandler)
 			sr.registry.Register(tool)
 			// Registry.Register forces Enabled=true, so we disable it again
 			sr.registry.Disable(fullName)

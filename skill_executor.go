@@ -1,6 +1,9 @@
 package tool
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // SkillExecutor is the single execution adapter for skill-defined tools.
 // Loader discovers skill metadata; registry owns lifecycle; executor turns a
@@ -37,7 +40,11 @@ func (e *SkillExecutor) Execute(skill *SkillInfo, toolDef SkillToolDef, args map
 }
 
 func newSkillToolFromDef(skill *SkillInfo, toolDef SkillToolDef, handler func(args map[string]any) (string, error)) *Tool {
-	return &Tool{
+	return newSkillToolFromDefWithContext(skill, toolDef, handler, nil)
+}
+
+func newSkillToolFromDefWithContext(skill *SkillInfo, toolDef SkillToolDef, handler func(args map[string]any) (string, error), contextHandler func(context.Context, map[string]any) (string, error)) *Tool {
+	t := &Tool{
 		Name:            fmt.Sprintf("skill_%s_%s", skill.Name, toolDef.Name),
 		Description:     toolDef.Description,
 		Parameters:      toolDef.Parameters,
@@ -48,4 +55,13 @@ func newSkillToolFromDef(skill *SkillInfo, toolDef SkillToolDef, handler func(ar
 		Enabled:         true,
 		HiddenFromModel: !toolDef.ExposeToModel && toolDef.Name != "run",
 	}
+	t.ContextDetailedHandler = func(exec ExecutionContext, args map[string]any) (ToolCallResult, error) {
+		if contextHandler != nil {
+			out, err := contextHandler(exec.Context, args)
+			return ToolCallResult{Output: out}, err
+		}
+		out, err := handler(args)
+		return ToolCallResult{Output: out}, err
+	}
+	return t
 }

@@ -615,7 +615,13 @@ func RegisterSkillTools(r *Registry, skills []*SkillInfo, handler func(toolName 
 			} else {
 				toolHandler, _ = executor.HandlerFor(skill, toolDef)
 			}
-			r.Register(newSkillToolFromDef(skill, toolDef, toolHandler))
+			var contextHandler func(context.Context, map[string]any) (string, error)
+			if handler == nil && toolDef.Handler == nil {
+				contextHandler = func(ctx context.Context, args map[string]any) (string, error) {
+					return defaultSkillHandlerContext(ctx, toolDef, skill.Dir, skill.Name, args)
+				}
+			}
+			r.Register(newSkillToolFromDefWithContext(skill, toolDef, toolHandler, contextHandler))
 		}
 	}
 }
@@ -623,51 +629,62 @@ func RegisterSkillTools(r *Registry, skills []*SkillInfo, handler func(toolName 
 // defaultSkillHandler 为 skill 工具提供默认执行逻辑
 func defaultSkillHandler(toolDef SkillToolDef, skillDir, skillName string) func(args map[string]any) (string, error) {
 	return func(args map[string]any) (string, error) {
-		toolName := toolDef.Name
-		// 1. 尝试执行 scripts/<toolName>.sh 或 .py
-		for _, ext := range []string{".sh", ".py", ".js"} {
-			scriptPath := filepath.Join(skillDir, "scripts", toolName+ext)
-			if _, err := os.Stat(scriptPath); err == nil {
-				return executeScript(scriptPath, args)
-			}
-		}
-
-		// 2. 尝试执行 scripts/ 目录下唯一的脚本
-		scriptsDir := filepath.Join(skillDir, "scripts")
-		if entries, err := os.ReadDir(scriptsDir); err == nil && len(entries) == 1 {
-			if !entries[0].IsDir() {
-				scriptPath := filepath.Join(scriptsDir, entries[0].Name())
-				if len(toolDef.Command) > 0 {
-					return executeScriptWithCommand(scriptPath, toolDef.Command, args)
-				}
-				return executeScript(scriptPath, args)
-			}
-		}
-
-		// 3. 返回 SKILL.md 内容摘要
-		skillFile := filepath.Join(skillDir, "SKILL.md")
-		if data, err := os.ReadFile(skillFile); err == nil {
-			content := string(data)
-			// 去掉 frontmatter
-			body := stripFrontmatter(content)
-			// 截取前 500 字符作为摘要
-			if len(body) > 500 {
-				body = body[:497] + "..."
-			}
-			return fmt.Sprintf("[Skill: %s / Tool: %s]\n%s", skillName, toolName, body), nil
-		}
-
-		return fmt.Sprintf("Skill '%s' tool '%s' — no executable script found and SKILL.md unreadable", skillName, toolName), nil
+		return defaultSkillHandlerContext(context.Background(), toolDef, skillDir, skillName, args)
 	}
+}
+
+func defaultSkillHandlerContext(ctx context.Context, toolDef SkillToolDef, skillDir, skillName string, args map[string]any) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	toolName := toolDef.Name
+	// 1. 尝试执行 scripts/<toolName>.sh 或 .py
+	for _, ext := range []string{".sh", ".py", ".js"} {
+		scriptPath := filepath.Join(skillDir, "scripts", toolName+ext)
+		if _, err := os.Stat(scriptPath); err == nil {
+			return executeScriptContext(ctx, scriptPath, args)
+		}
+	}
+
+	// 2. 尝试执行 scripts/ 目录下唯一的脚本
+	scriptsDir := filepath.Join(skillDir, "scripts")
+	if entries, err := os.ReadDir(scriptsDir); err == nil && len(entries) == 1 {
+		if !entries[0].IsDir() {
+			scriptPath := filepath.Join(scriptsDir, entries[0].Name())
+			if len(toolDef.Command) > 0 {
+				return executeScriptWithCommandContext(ctx, scriptPath, toolDef.Command, args)
+			}
+			return executeScriptContext(ctx, scriptPath, args)
+		}
+	}
+
+	// 3. 返回 SKILL.md 内容摘要
+	skillFile := filepath.Join(skillDir, "SKILL.md")
+	if data, err := os.ReadFile(skillFile); err == nil {
+		content := string(data)
+		// 去掉 frontmatter
+		body := stripFrontmatter(content)
+		// 截取前 500 字符作为摘要
+		if len(body) > 500 {
+			body = body[:497] + "..."
+		}
+		return fmt.Sprintf("[Skill: %s / Tool: %s]\n%s", skillName, toolName, body), nil
+	}
+
+	return fmt.Sprintf("Skill '%s' tool '%s' — no executable script found and SKILL.md unreadable", skillName, toolName), nil
 }
 
 // executeScript 执行脚本并返回输出
 func executeScript(scriptPath string, args map[string]any) (string, error) {
+	return executeScriptContext(context.Background(), scriptPath, args)
+}
+
+func executeScriptContext(ctx context.Context, scriptPath string, args map[string]any) (string, error) {
 	baseCmd, err := buildSkillScriptCommand(scriptPath)
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command(baseCmd[0], baseCmd[1:]...)
+	cmd := exec.CommandContext(ctx, baseCmd[0], baseCmd[1:]...)
 
 	// 将 args 序列化为环境变量
 	for k, v := range args {
@@ -682,6 +699,10 @@ func executeScript(scriptPath string, args map[string]any) (string, error) {
 }
 
 func executeScriptWithCommand(scriptPath string, commandParts []string, args map[string]any) (string, error) {
+	return executeScriptWithCommandContext(context.Background(), scriptPath, commandParts, args)
+}
+
+func executeScriptWithCommandContext(ctx context.Context, scriptPath string, commandParts []string, args map[string]any) (string, error) {
 	baseCmd, err := buildSkillScriptCommand(scriptPath, commandParts...)
 	if err != nil {
 		return "", err
@@ -689,7 +710,7 @@ func executeScriptWithCommand(scriptPath string, commandParts []string, args map
 	if rawArgs, ok := args["args"].(string); ok && strings.TrimSpace(rawArgs) != "" {
 		baseCmd = append(baseCmd, strings.Fields(rawArgs)...)
 	}
-	cmd := exec.Command(baseCmd[0], baseCmd[1:]...)
+	cmd := exec.CommandContext(ctx, baseCmd[0], baseCmd[1:]...)
 	for k, v := range args {
 		cmd.Env = append(cmd.Environ(), fmt.Sprintf("SKILL_ARG_%s=%v", strings.ToUpper(k), v))
 	}

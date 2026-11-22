@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -382,6 +383,24 @@ func TestSkillLoaderCLIInspectTimeout(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Load did not return; the --help probe is unbounded")
+	}
+}
+
+func TestSkillScriptExecutionHonorsContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixture is POSIX-only")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "run.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := executeScriptContext(ctx, script, nil)
+	if err == nil || time.Since(started) > 3*time.Second {
+		t.Fatalf("skill script ignored cancellation: err=%v elapsed=%s", err, time.Since(started))
 	}
 }
 

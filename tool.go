@@ -56,7 +56,11 @@ type Tool struct {
 	// or cancellation. Existing tools can continue using Handler or
 	// DetailedHandler without changing their call sites.
 	ContextDetailedHandler func(exec ExecutionContext, args map[string]any) (ToolCallResult, error)
-	Permission             PermissionLevel // 权限级别
+	// RequiresContext prevents context-free compatibility entry points from
+	// executing a tool with context.Background(). Context-aware callers must
+	// use CallWithContext or CallDetailedWithContext.
+	RequiresContext bool
+	Permission      PermissionLevel // 权限级别
 	// PermissionFor reports the permission of one call. Nil uses Permission.
 	// A tool that mixes read and write actions uses this so a read does not
 	// inherit the approval required by a write.
@@ -374,6 +378,9 @@ func (r *Registry) ListModelVisible() []*Tool {
 
 // Call 调用工具
 func (r *Registry) Call(name string, args map[string]any) (string, error) {
+	if err := r.rejectContextFree(name); err != nil {
+		return "", err
+	}
 	result, err := r.CallDetailedWithContext(name, args, ExecutionContext{Context: context.Background()})
 	return result.Output, err
 }
@@ -386,7 +393,21 @@ func (r *Registry) CallWithContext(name string, args map[string]any, exec Execut
 }
 
 func (r *Registry) CallDetailed(name string, args map[string]any) (ToolCallResult, error) {
+	if err := r.rejectContextFree(name); err != nil {
+		return ToolCallResult{}, err
+	}
 	return r.CallDetailedWithContext(name, args, ExecutionContext{Context: context.Background()})
+}
+
+func (r *Registry) rejectContextFree(name string) error {
+	t, err := r.executableTool(name)
+	if err != nil {
+		return err
+	}
+	if t.RequiresContext {
+		return fmt.Errorf("tool %s requires request context; use CallWithContext or CallDetailedWithContext", t.Name)
+	}
+	return nil
 }
 
 // executableTool resolves a tool and applies enablement and permission checks.
@@ -449,6 +470,9 @@ func (r *Registry) CallWithShellContext(name string, args map[string]any, sc *Sh
 }
 
 func (r *Registry) CallDetailedWithShellContext(name string, args map[string]any, sc *ShellContext) (ToolCallResult, error) {
+	if err := r.rejectContextFree(name); err != nil {
+		return ToolCallResult{}, err
+	}
 	return r.CallDetailedWithShellExecutionContext(name, args, sc, ExecutionContext{Context: context.Background()})
 }
 

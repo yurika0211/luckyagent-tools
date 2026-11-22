@@ -103,6 +103,26 @@ func TestCallDetailedWithContext(t *testing.T) {
 	}
 }
 
+func TestRequiresContextRejectsContextFreeEntryPoints(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&Tool{
+		Name: "context-required", Permission: PermAuto, RequiresContext: true,
+		ContextDetailedHandler: func(exec ExecutionContext, _ map[string]any) (ToolCallResult, error) {
+			return ToolCallResult{Output: exec.SessionID}, nil
+		},
+	})
+	if _, err := r.Call("context-required", nil); err == nil || !strings.Contains(err.Error(), "requires request context") {
+		t.Fatalf("Call should reject context-free execution: %v", err)
+	}
+	if _, err := r.CallDetailed("context-required", nil); err == nil || !strings.Contains(err.Error(), "requires request context") {
+		t.Fatalf("CallDetailed should reject context-free execution: %v", err)
+	}
+	result, err := r.CallDetailedWithContext("context-required", nil, ExecutionContext{Context: context.Background(), SessionID: "request"})
+	if err != nil || result.Output != "request" {
+		t.Fatalf("context-aware execution failed: %#v, %v", result, err)
+	}
+}
+
 func TestCallNotFound(t *testing.T) {
 	r := NewRegistry()
 	_, err := r.Call("nonexistent", nil)

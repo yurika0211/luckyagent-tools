@@ -302,7 +302,7 @@ func (s *EphemeralCredentialTerminalToolService) execute(execCtx ExecutionContex
 		output = redactEphemeralTerminalOutput(stdout.String(), stderr.String(), secret)
 		if runErr != nil {
 			if commandCtx.Err() != nil {
-				return fmt.Errorf("temporary credential terminal command timed out after %d seconds", int(item.timeout/time.Second))
+				return &UncertainOperationError{Operation: item.displayName, Cause: fmt.Errorf("temporary credential terminal command timed out after %d seconds", int(item.timeout/time.Second))}
 			}
 			output += fmt.Sprintf("\n[exit code: %v]", runErr)
 		}

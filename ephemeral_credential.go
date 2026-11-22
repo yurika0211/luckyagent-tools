@@ -29,6 +29,31 @@ const (
 	ephemeralCredentialMaxOutput   = 1 << 20
 )
 
+// UncertainOperationError means a write may have reached the remote side but
+// the client did not receive a definitive result. Callers must verify it
+// before retrying.
+type UncertainOperationError struct {
+	Operation string
+	Cause     error
+}
+
+func (e *UncertainOperationError) Error() string {
+	if e == nil {
+		return "temporary credential operation result is unknown; verify before retry"
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("temporary credential operation %q result is unknown; verify before retry", e.Operation)
+	}
+	return fmt.Sprintf("temporary credential operation %q result is unknown; verify before retry: %v", e.Operation, e.Cause)
+}
+
+func (e *UncertainOperationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 var ephemeralTemplateToken = regexp.MustCompile(`\{([A-Za-z][A-Za-z0-9_]*)\}`)
 
 // Kept as a variable so focused tests can use an httptest server without
@@ -46,20 +71,21 @@ type EphemeralCredentialToolService struct {
 }
 
 type ephemeralCredentialTool struct {
-	scope         string
-	name          string
-	displayName   string
-	description   string
-	credentialRef string
-	method        string
-	urlTemplate   string
-	bodyTemplate  string
-	authType      string
-	headerName    string
-	staticHeaders map[string]string
-	parameters    map[string]Param
-	expiresAt     time.Time
-	maxResponse   int
+	scope          string
+	name           string
+	displayName    string
+	description    string
+	credentialRef  string
+	method         string
+	idempotencyKey string
+	urlTemplate    string
+	bodyTemplate   string
+	authType       string
+	headerName     string
+	staticHeaders  map[string]string
+	parameters     map[string]Param
+	expiresAt      time.Time
+	maxResponse    int
 }
 
 // NewEphemeralCredentialToolService creates the in-memory temporary-tool
@@ -97,6 +123,7 @@ func (s *EphemeralCredentialToolService) factoryTool() *Tool {
 			"name":               {Type: "string", Description: "Human-readable operation name. The runtime generates the actual temporary tool name.", Required: true},
 			"description":        {Type: "string", Description: "Short description shown to the model when the temporary tool is available.", Required: true},
 			"method":             {Type: "string", Description: "HTTP method. GET, HEAD, OPTIONS, POST, PUT, PATCH, and DELETE are supported; mutation methods require approval.", Required: false, Default: "GET"},
+			"idempotency_key":    {Type: "string", Description: "Optional stable key for retried writes; sent as Idempotency-Key to compatible servers.", Required: false},
 			"url_template":       {Type: "string", Description: "HTTP or HTTPS URL template. Use {parameter} placeholders only in the path or query; the host is fixed at creation time.", Required: true},
 			"body_template":      {Type: "string", Description: "Optional JSON template. Use {parameter} placeholders as JSON values, for example {\"query\":{query}}.", Required: false},
 			"auth_type":          {Type: "string", Description: "Authentication mode: bearer, api_key, or raw_header.", Required: false, Default: "bearer"},
@@ -195,7 +222,7 @@ func (s *EphemeralCredentialToolService) create(exec ExecutionContext, args map[
 	}
 	item := &ephemeralCredentialTool{
 		scope: scope, name: name, displayName: spec.displayName, description: spec.description,
-		credentialRef: spec.credentialRef, method: spec.method, urlTemplate: spec.urlTemplate,
+		credentialRef: spec.credentialRef, method: spec.method, idempotencyKey: spec.idempotencyKey, urlTemplate: spec.urlTemplate,
 		bodyTemplate: spec.bodyTemplate, authType: spec.authType, headerName: spec.headerName,
 		staticHeaders: spec.staticHeaders, parameters: spec.parameters, expiresAt: time.Now().Add(spec.ttl),
 		maxResponse: spec.maxResponse,
@@ -204,22 +231,23 @@ func (s *EphemeralCredentialToolService) create(exec ExecutionContext, args map[
 	registry := s.registry
 	s.mu.Unlock()
 	registry.Register(item.asToolBound(s))
-	return ToolCallResult{Output: fmt.Sprintf("Temporary credential tool created. tool_name=%s name=%s credential_ref=%s expires_at=%s", item.name, item.displayName, item.credentialRef, item.expiresAt.UTC().Format(time.RFC3339))}, nil
+	return ToolCallResult{Output: fmt.Sprintf("Temporary credential tool created. tool_name=%s name=%s credential_ref=%s idempotency_key=%s expires_at=%s", item.name, item.displayName, item.credentialRef, item.idempotencyKey, item.expiresAt.UTC().Format(time.RFC3339))}, nil
 }
 
 type parsedEphemeralSpec struct {
-	displayName   string
-	description   string
-	credentialRef string
-	method        string
-	urlTemplate   string
-	bodyTemplate  string
-	authType      string
-	headerName    string
-	staticHeaders map[string]string
-	parameters    map[string]Param
-	ttl           time.Duration
-	maxResponse   int
+	displayName    string
+	description    string
+	credentialRef  string
+	method         string
+	idempotencyKey string
+	urlTemplate    string
+	bodyTemplate   string
+	authType       string
+	headerName     string
+	staticHeaders  map[string]string
+	parameters     map[string]Param
+	ttl            time.Duration
+	maxResponse    int
 }
 
 func parseEphemeralCredentialSpec(args map[string]any) (parsedEphemeralSpec, error) {
@@ -243,6 +271,10 @@ func parseEphemeralCredentialSpec(args map[string]any) (parsedEphemeralSpec, err
 	}
 	if err := validateHTTPMethod(spec.method, true); err != nil {
 		return spec, err
+	}
+	spec.idempotencyKey = strings.TrimSpace(credentialStringArg(args, "idempotency_key"))
+	if len(spec.idempotencyKey) > 200 || strings.ContainsAny(spec.idempotencyKey, "\r\n") {
+		return spec, fmt.Errorf("idempotency_key must be at most 200 characters without newlines")
 	}
 	spec.urlTemplate = strings.TrimSpace(credentialStringArg(args, "url_template"))
 	if err := validateEphemeralURLTemplate(spec.urlTemplate); err != nil {
@@ -335,6 +367,9 @@ func (s *EphemeralCredentialToolService) execute(exec ExecutionContext, scope, n
 	for key, value := range item.staticHeaders {
 		req.Header.Set(key, value)
 	}
+	if item.idempotencyKey != "" && item.method != http.MethodGet && item.method != http.MethodHead && item.method != http.MethodOptions {
+		req.Header.Set("Idempotency-Key", item.idempotencyKey)
+	}
 	req.Header.Set("User-Agent", "luckyagent-ephemeral-credential-tool")
 	client := &http.Client{
 		Timeout: 60 * time.Second,
@@ -365,6 +400,9 @@ func (s *EphemeralCredentialToolService) execute(exec ExecutionContext, scope, n
 		defer req.Header.Del(item.headerName)
 		resp, requestErr := client.Do(req)
 		if requestErr != nil {
+			if requestCtx.Err() != nil && item.method != http.MethodGet && item.method != http.MethodHead && item.method != http.MethodOptions {
+				return &UncertainOperationError{Operation: item.displayName, Cause: requestErr}
+			}
 			return fmt.Errorf("send temporary credential request: %w", requestErr)
 		}
 		defer resp.Body.Close()

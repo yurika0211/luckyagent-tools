@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -64,6 +65,55 @@ func TestEphemeralCredentialToolInjectsAndRedactsSecret(t *testing.T) {
 
 	if _, err := generated.ContextDetailedHandler(ExecutionContext{Context: context.Background(), SessionID: "session-b"}, nil); err == nil {
 		t.Fatal("temporary tool was callable from another session")
+	}
+}
+
+func TestEphemeralCredentialToolSendsIdempotencyKeyForWrites(t *testing.T) {
+	provider := testCredentialProvider{}
+	var gotKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("Idempotency-Key")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("created"))
+	}))
+	defer server.Close()
+	oldValidator := ephemeralCredentialURLValidator
+	ephemeralCredentialURLValidator = func(string) error { return nil }
+	defer func() { ephemeralCredentialURLValidator = oldValidator }()
+
+	service := NewEphemeralCredentialToolService(provider)
+	registry := NewRegistry()
+	service.RegisterTools(registry)
+	created, err := service.create(ExecutionContext{Context: context.Background(), SessionID: "session-write"}, map[string]any{
+		"credential_ref": "github-main", "name": "create", "description": "Create a resource",
+		"method": "POST", "url_template": server.URL + "/resource", "idempotency_key": "operation-123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(created.Output, "idempotency_key=operation-123") {
+		t.Fatalf("creation output did not expose the retry key: %s", created.Output)
+	}
+	name := parseTemporaryToolName(t, created.Output)
+	generated, ok := registry.Get(name)
+	if !ok {
+		t.Fatal("generated tool missing")
+	}
+	if _, err := generated.ContextDetailedHandler(ExecutionContext{Context: context.Background(), SessionID: "session-write"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if gotKey != "operation-123" {
+		t.Fatalf("Idempotency-Key = %q", gotKey)
+	}
+}
+
+func TestUncertainOperationErrorRequiresVerification(t *testing.T) {
+	err := &UncertainOperationError{Operation: "create-resource", Cause: context.DeadlineExceeded}
+	if !strings.Contains(err.Error(), "unknown") || !strings.Contains(err.Error(), "verify before retry") {
+		t.Fatalf("unexpected uncertainty error: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("uncertainty error did not preserve the cause")
 	}
 }
 

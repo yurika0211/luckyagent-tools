@@ -1337,6 +1337,18 @@ func TestShellTimeoutKillsChildProcesses(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "timed out after 1 seconds") {
 		t.Fatalf("expected timeout error, got %v", err)
 	}
+	for _, want := range []string{"status=timeout", "requested_timeout=1", "elapsed_ms=", "killed=true"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("timeout body %q missing %q", err, want)
+		}
+	}
+	var reportedElapsed int64
+	if n, scanErr := fmt.Sscanf(err.Error(), "command timed out after 1 seconds; status=timeout requested_timeout=1 elapsed_ms=%d killed=true", &reportedElapsed); scanErr != nil || n != 1 {
+		t.Fatalf("cannot read measured timeout duration from %q: %v", err, scanErr)
+	}
+	if reportedElapsed < 1000 || reportedElapsed > elapsed.Milliseconds() {
+		t.Fatalf("reported elapsed_ms=%d does not match actual timeout duration %s", reportedElapsed, elapsed)
+	}
 	if elapsed > 8*time.Second {
 		t.Fatalf("timeout returned too slowly: %s", elapsed)
 	}
@@ -1356,8 +1368,14 @@ func TestShellTimeoutKillsChildProcesses(t *testing.T) {
 }
 
 func TestShellTimeoutClamp(t *testing.T) {
-	if got := clampShellTimeout(0); got != 30 {
-		t.Fatalf("non-positive timeout = %d, want 30", got)
+	if got := TerminalTool().Parameters["timeout"].Default; got != 120 {
+		t.Fatalf("schema default = %v, want 120", got)
+	}
+	if got := shellTimeoutArg(nil); got != 120 {
+		t.Fatalf("omitted timeout = %d, want 120", got)
+	}
+	if got := clampShellTimeout(0); got != 120 {
+		t.Fatalf("non-positive timeout = %d, want 120", got)
 	}
 	if got := clampShellTimeout(30); got != 30 {
 		t.Fatalf("default timeout = %d, want 30", got)
@@ -1371,7 +1389,7 @@ func TestShellTimeoutClamp(t *testing.T) {
 }
 
 func TestShellTimeoutErrorNamesHardLimitOnlyWhenClamped(t *testing.T) {
-	clamped := shellTimeoutError(5000, clampShellTimeout(5000))
+	clamped := shellTimeoutError(5000, clampShellTimeout(5000), 900*time.Second, true)
 	if clamped == nil {
 		t.Fatal("expected clamp timeout error")
 	}
@@ -1383,12 +1401,12 @@ func TestShellTimeoutErrorNamesHardLimitOnlyWhenClamped(t *testing.T) {
 	}
 
 	for _, requested := range []int{30, 900} {
-		err := shellTimeoutError(requested, clampShellTimeout(requested))
+		err := shellTimeoutError(requested, clampShellTimeout(requested), time.Second, false)
 		text := err.Error()
-		if strings.Contains(text, "hard limit") || strings.Contains(text, "requested") {
+		if strings.Contains(text, "hard limit") {
 			t.Fatalf("timeout %d should not mention the clamp: %s", requested, text)
 		}
-		want := fmt.Sprintf("command timed out after %d seconds", requested)
+		want := fmt.Sprintf("command timed out after %d seconds; status=timeout requested_timeout=%d elapsed_ms=1000 killed=false", requested, requested)
 		if text != want {
 			t.Fatalf("timeout %d error = %q, want %q", requested, text, want)
 		}

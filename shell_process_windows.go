@@ -9,11 +9,11 @@ import (
 
 func configureShellProcessGroup(cmd *exec.Cmd) {}
 
-func killShellProcessGroup(cmd *exec.Cmd) {
+func killShellProcessGroup(cmd *exec.Cmd) bool {
 	if cmd == nil || cmd.Process == nil {
-		return
+		return false
 	}
-	_ = cmd.Process.Kill()
+	return cmd.Process.Kill() == nil
 }
 
 func signalShellTerm(cmd *exec.Cmd) {

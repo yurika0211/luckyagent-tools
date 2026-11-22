@@ -27,19 +27,22 @@ const (
 	maxFileWriteBytes    = 25 * 1024 * 1024
 	maxFileSendBytes     = 31 << 20
 	defaultDeleteMax     = 1000
+	defaultShellTimeout  = 120
+	maxShellTimeout      = 900
 )
 
 type filesystemOperation string
 
 const (
-	filesystemRead filesystemOperation = "read"
+	filesystemRead  filesystemOperation = "read"
+	filesystemWrite filesystemOperation = "write"
 )
 
-// FilesystemPolicy extends the built-in filesystem sandbox with explicit,
-// read-only roots. Write, patch, move, mkdir, and delete operations continue to
-// use the built-in sandbox only.
+// FilesystemPolicy extends the built-in roots with explicit read and write roots.
+// Write roots also permit reading. Empty roots retain the built-in policy.
 type FilesystemPolicy struct {
 	AllowedReadRoots    []string
+	AllowedWriteRoots   []string
 	AllowOutsideSandbox bool
 }
 
@@ -73,7 +76,8 @@ func AskUserTool() *Tool {
 	}
 }
 
-func TerminalTool() *Tool {
+func TerminalTool(policies ...FilesystemPolicy) *Tool {
+	policy := filesystemPolicyFromOptional(policies)
 	return &Tool{
 		Name:         "terminal",
 		Description:  "Run a terminal command when you need to inspect runtime state, execute project commands, check the environment, or perform real system actions that cannot be answered from files alone.",
@@ -83,14 +87,16 @@ func TerminalTool() *Tool {
 		ShellAware:   true,
 		ParallelSafe: false,
 		Parameters: map[string]Param{
-			"command": {Type: "string", Description: "Concrete terminal command to run. Prefer precise inspection or execution commands over exploratory one-liners.", Required: true},
-			"timeout": {Type: "number", Description: "Foreground wait in seconds (default 30, max 900). Long builds and tests should pass this explicitly. Waits longer than 900s are clamped. Ignored when background is true: a background command is not killed on timeout.", Required: false, Default: 30},
+			"command":    {Type: "string", Description: "Concrete terminal command to run. Prefer precise inspection or execution commands over exploratory one-liners.", Required: true},
+			"timeout":    {Type: "number", Description: "Foreground wait in seconds (default 120, max 900). Use background=true for long builds and tests. Waits longer than 900s are clamped. Ignored when background is true: a background command is not killed on timeout.", Required: false, Default: defaultShellTimeout},
 			"workdir":    {Type: "string", Description: "Optional working directory. Use when the command must run in a specific project or subdirectory.", Required: false},
 			"background": {Type: "boolean", Description: "When true, start the command and return task_id immediately. The process keeps running. Read it with terminal_output and stop it with terminal_kill. Default false.", Required: false, Default: false},
 		},
-		Handler: handleShell,
+		Handler: func(args map[string]any) (string, error) {
+			return handleShellWithPolicy(nil, args, policy)
+		},
 		ContextDetailedHandler: func(exec ExecutionContext, args map[string]any) (ToolCallResult, error) {
-			out, err := handleShellWithSandbox(exec.Sandbox, args)
+			out, err := handleShellWithPolicy(exec.Sandbox, args, policy)
 			return ToolCallResult{Output: out}, err
 		},
 	}
@@ -139,14 +145,25 @@ func TerminalKillTool() *Tool {
 }
 
 func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (string, error) {
+	return handleShellWithPolicy(snapshot, args, DefaultFilesystemPolicy())
+}
+
+func handleShellWithPolicy(snapshot *sandbox.Snapshot, args map[string]any, policy FilesystemPolicy) (string, error) {
 	command, ok := args["command"].(string)
 	if !ok {
 		return "", fmt.Errorf("command is required")
+	}
+	policy = filesystemPolicyFromArgs(args, policy)
+	if snapshot != nil && snapshot.Restricted() {
+		policy.AllowedWriteRoots = append(append([]string(nil), policy.AllowedWriteRoots...), snapshot.Root)
 	}
 	// The dev mode is intentionally permissive for normal project work. Direct
 	// calls without an execution snapshot retain the legacy command guard.
 	if snapshot == nil || snapshot.Restricted() {
 		if err := validateShellSandbox(command); err != nil {
+			if strings.Contains(err.Error(), "restricted path") {
+				return "", fmt.Errorf("%w; %s", err, filesystemPolicyDescription(policy))
+			}
 			return "", err
 		}
 	}
@@ -164,6 +181,15 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 	if w, ok := args["workdir"]; ok {
 		if ws, ok := w.(string); ok && ws != "" {
 			workdir = ws
+		}
+	}
+	if snapshot == nil || snapshot.Mode != sandbox.ModeDev {
+		if !policy.AllowOutsideSandbox {
+			var err error
+			workdir, err = terminalFilesystemPreflight(command, workdir, cwd, policy)
+			if err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -199,6 +225,7 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	configureShellProcessGroup(cmd)
+	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
@@ -214,9 +241,9 @@ func handleShellWithSandbox(snapshot *sandbox.Snapshot, args map[string]any) (st
 		}
 		return output, nil
 	case <-time.After(ctx):
-		killShellProcessGroup(cmd)
+		killed := killShellProcessGroup(cmd)
 		<-done
-		return "", shellTimeoutError(requested, timeout)
+		return "", shellTimeoutError(requested, timeout, time.Since(started), killed)
 	}
 }
 
@@ -252,7 +279,7 @@ func shellOutputWaitArg(args map[string]any) int {
 }
 
 func shellTimeoutArg(args map[string]any) int {
-	timeout := 30
+	timeout := defaultShellTimeout
 	if t, ok := args["timeout"]; ok {
 		switch v := t.(type) {
 		case float64:
@@ -266,10 +293,10 @@ func shellTimeoutArg(args map[string]any) int {
 
 func clampShellTimeout(timeout int) int {
 	if timeout <= 0 {
-		return 30
+		return defaultShellTimeout
 	}
-	if timeout > 900 {
-		return 900
+	if timeout > maxShellTimeout {
+		return maxShellTimeout
 	}
 	return timeout
 }
@@ -277,11 +304,12 @@ func clampShellTimeout(timeout int) int {
 // shellTimeoutError reports the timeout that was actually enforced. A request
 // above the 900s cap still runs for 900s, and the error names both numbers so
 // the caller does not treat the clamp as a still-running command.
-func shellTimeoutError(requested, clamped int) error {
-	if requested > 900 {
-		return fmt.Errorf("command timed out after %d seconds (hard limit %d; requested %d)", clamped, 900, requested)
+func shellTimeoutError(requested, clamped int, elapsed time.Duration, killed bool) error {
+	limit := ""
+	if requested > maxShellTimeout {
+		limit = fmt.Sprintf(" (hard limit %d; requested %d)", maxShellTimeout, requested)
 	}
-	return fmt.Errorf("command timed out after %d seconds", clamped)
+	return fmt.Errorf("command timed out after %d seconds%s; status=timeout requested_timeout=%d elapsed_ms=%d killed=%t", clamped, limit, requested, elapsed.Milliseconds(), killed)
 }
 
 func shellEnvPrefix(env map[string]string, goos string) string {
@@ -344,13 +372,13 @@ func parseFileReadRange(args map[string]any) (offset, limit int) {
 func readTextFileRange(path string, offset, limit int) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("open file: %w", err)
+		return "", filesystemPathError("open file", path, err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return "", fmt.Errorf("stat file: %w", err)
+		return "", filesystemPathError("stat file", path, err)
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("file_read expects a file, got directory: %s", path)
@@ -423,7 +451,8 @@ func trimLineEnding(line string) string {
 	return strings.TrimSuffix(line, "\r")
 }
 
-func FileWriteTool() *Tool {
+func FileWriteTool(policies ...FilesystemPolicy) *Tool {
+	policy := filesystemPolicyFromOptional(policies)
 	return &Tool{
 		Name:        "file_write",
 		Description: "Write a complete local file. Use dry_run=true to preview, mode=create|overwrite|upsert to control existing files, and expected_sha256 to protect against concurrent changes.",
@@ -438,7 +467,9 @@ func FileWriteTool() *Tool {
 			"dry_run":         {Type: "boolean", Description: "Preview the write plan without changing the filesystem. Default false.", Required: false, Default: false},
 			"expected_sha256": {Type: "string", Description: "Optional SHA-256 hash the existing file must match before overwriting.", Required: false},
 		},
-		Handler: handleFileWrite,
+		Handler: func(args map[string]any) (string, error) {
+			return handleFileWriteWithPolicy(args, policy)
+		},
 	}
 }
 
@@ -457,7 +488,11 @@ type fileWritePlan struct {
 }
 
 func handleFileWrite(args map[string]any) (string, error) {
-	path, pathErr := resolvePathArg(args, "path")
+	return handleFileWriteWithPolicy(args, DefaultFilesystemPolicy())
+}
+
+func handleFileWriteWithPolicy(args map[string]any, policy FilesystemPolicy) (string, error) {
+	path, pathErr := resolveWritePathArg(args, "path", policy)
 	content, ok := args["content"].(string)
 	if !ok {
 		return "", fmt.Errorf("content is required")
@@ -533,18 +568,18 @@ func buildFileWritePlan(path string, content []byte, mode, expectedSHA string) (
 		plan.SameContent = bytes.Equal(data, content)
 	case errors.Is(err, os.ErrNotExist):
 	default:
-		return plan, 0, fmt.Errorf("stat file: %w", err)
+		return plan, 0, filesystemPathError("stat file", path, err)
 	}
 
 	if mode == "create" && plan.Exists {
 		return plan, 0, fmt.Errorf("file already exists: %s", path)
 	}
 	if mode == "overwrite" && !plan.Exists {
-		return plan, 0, fmt.Errorf("file does not exist for overwrite mode: %s", path)
+		return plan, 0, fmt.Errorf("not_found: file does not exist for overwrite mode: %s: %w", path, err)
 	}
 	if expectedSHA != "" {
 		if !plan.Exists {
-			return plan, 0, fmt.Errorf("expected_sha256 requires an existing file: %s", path)
+			return plan, 0, fmt.Errorf("not_found: expected_sha256 requires an existing file: %s: %w", path, err)
 		}
 		if plan.OldSHA256 != expectedSHA {
 			return plan, 0, fmt.Errorf("existing file sha256 mismatch: got %s, expected %s", plan.OldSHA256, expectedSHA)
@@ -566,7 +601,8 @@ func sha256Hex(data []byte) string {
 	return fmt.Sprintf("%x", sum)
 }
 
-func FileMkdirTool() *Tool {
+func FileMkdirTool(policies ...FilesystemPolicy) *Tool {
+	policy := filesystemPolicyFromOptional(policies)
 	return &Tool{
 		Name:        "file_mkdir",
 		Description: "Create a directory on disk. Use dry_run=true to preview the directory creation plan before changing the filesystem.",
@@ -579,7 +615,9 @@ func FileMkdirTool() *Tool {
 			"recursive": {Type: "boolean", Description: "Create parent directories when needed. Default true.", Required: false, Default: true},
 			"dry_run":   {Type: "boolean", Description: "Preview what would be created without changing the filesystem. Default false.", Required: false, Default: false},
 		},
-		Handler: handleFileMkdir,
+		Handler: func(args map[string]any) (string, error) {
+			return handleFileMkdirWithPolicy(args, policy)
+		},
 	}
 }
 
@@ -591,7 +629,11 @@ type mkdirPlan struct {
 }
 
 func handleFileMkdir(args map[string]any) (string, error) {
-	path, err := resolvePathArg(args, "path")
+	return handleFileMkdirWithPolicy(args, DefaultFilesystemPolicy())
+}
+
+func handleFileMkdirWithPolicy(args map[string]any, policy FilesystemPolicy) (string, error) {
+	path, err := resolveWritePathArg(args, "path", policy)
 	if err != nil {
 		return "", err
 	}
@@ -655,7 +697,7 @@ func buildMkdirPlan(path string, recursive bool) (mkdirPlan, error) {
 		case err == nil:
 			return plan, fmt.Errorf("parent path exists and is not a directory: %s", parent)
 		case errors.Is(err, os.ErrNotExist):
-			return plan, fmt.Errorf("parent directory does not exist: %s; set recursive=true to create parents", parent)
+			return plan, fmt.Errorf("not_found: parent directory does not exist: %s; set recursive=true to create parents: %w", parent, err)
 		default:
 			return plan, fmt.Errorf("stat parent directory: %w", err)
 		}
@@ -688,7 +730,8 @@ func reverseStrings(values []string) {
 	}
 }
 
-func FileMoveTool() *Tool {
+func FileMoveTool(policies ...FilesystemPolicy) *Tool {
+	policy := filesystemPolicyFromOptional(policies)
 	return &Tool{
 		Name:        "file_move",
 		Description: "Move or rename a file or directory on disk. Use dry_run=true to preview the move plan before changing files.",
@@ -702,7 +745,9 @@ func FileMoveTool() *Tool {
 			"overwrite": {Type: "boolean", Description: "Replace an existing destination if present. Default false.", Required: false, Default: false},
 			"dry_run":   {Type: "boolean", Description: "Preview the move plan without changing the filesystem. Default false.", Required: false, Default: false},
 		},
-		Handler: handleFileMove,
+		Handler: func(args map[string]any) (string, error) {
+			return handleFileMoveWithPolicy(args, policy)
+		},
 	}
 }
 
@@ -718,11 +763,15 @@ type movePlan struct {
 }
 
 func handleFileMove(args map[string]any) (string, error) {
-	src, err := resolvePathArg(args, "src")
+	return handleFileMoveWithPolicy(args, DefaultFilesystemPolicy())
+}
+
+func handleFileMoveWithPolicy(args map[string]any, policy FilesystemPolicy) (string, error) {
+	src, err := resolveWritePathArg(args, "src", policy)
 	if err != nil {
 		return "", err
 	}
-	dst, err := resolvePathArg(args, "dst")
+	dst, err := resolveWritePathArg(args, "dst", policy)
 	if err != nil {
 		return "", err
 	}
@@ -756,7 +805,7 @@ func buildMovePlan(src, dst string, overwrite bool) (movePlan, error) {
 	srcInfo, err := os.Lstat(src)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return plan, fmt.Errorf("source path does not exist: %s", src)
+			return plan, filesystemPathError("stat source", src, err)
 		}
 		return plan, fmt.Errorf("stat source: %w", err)
 	}
@@ -880,7 +929,8 @@ func copyFileThenRemove(src, dst string) error {
 	return nil
 }
 
-func FileDeleteTool() *Tool {
+func FileDeleteTool(policies ...FilesystemPolicy) *Tool {
+	policy := filesystemPolicyFromOptional(policies)
 	return &Tool{
 		Name:        "file_delete",
 		Description: "Delete a file or directory. Use dry_run=true to preview recursive deletion, trash=true to quarantine instead of permanent deletion, and missing_ok=true to ignore absent paths.",
@@ -896,7 +946,9 @@ func FileDeleteTool() *Tool {
 			"trash":       {Type: "boolean", Description: "Move the target to ~/.luckyagent/trash instead of deleting permanently. Default false.", Required: false, Default: false},
 			"max_entries": {Type: "number", Description: "Maximum entries allowed for recursive permanent deletion. Default 1000.", Required: false, Default: defaultDeleteMax},
 		},
-		Handler: handleFileDelete,
+		Handler: func(args map[string]any) (string, error) {
+			return handleFileDeleteWithPolicy(args, policy)
+		},
 	}
 }
 
@@ -912,7 +964,11 @@ type deletePlan struct {
 }
 
 func handleFileDelete(args map[string]any) (string, error) {
-	path, err := resolvePathArg(args, "path")
+	return handleFileDeleteWithPolicy(args, DefaultFilesystemPolicy())
+}
+
+func handleFileDeleteWithPolicy(args map[string]any, policy FilesystemPolicy) (string, error) {
+	path, err := resolveWritePathArg(args, "path", policy)
 	if err != nil {
 		return "", err
 	}
@@ -972,7 +1028,7 @@ func buildDeletePlan(path string, recursive, trash bool, maxEntries int) (delete
 		if errors.Is(err, os.ErrNotExist) {
 			plan.Exists = false
 			plan.Action = "absent"
-			return plan, os.ErrNotExist
+			return plan, filesystemPathError("stat path", path, err)
 		}
 		return plan, fmt.Errorf("stat path: %w", err)
 	}
@@ -994,7 +1050,7 @@ func buildDeletePlan(path string, recursive, trash bool, maxEntries int) (delete
 	if !recursive {
 		entries, err := os.ReadDir(path)
 		if err != nil {
-			return plan, fmt.Errorf("read directory: %w", err)
+			return plan, filesystemPathError("read directory", path, err)
 		}
 		plan.EntryCount = len(entries) + 1
 		if len(entries) > 0 {
@@ -1080,7 +1136,8 @@ func entrySuffix(count int) string {
 	return "ies"
 }
 
-func FilePatchTool() *Tool {
+func FilePatchTool(policies ...FilesystemPolicy) *Tool {
+	policy := filesystemPolicyFromOptional(policies)
 	return &Tool{
 		Name:        "file_patch",
 		Description: "Apply an in-place edit to an existing text file. Supports dry_run preview, expected_sha256 protection, exact replacement, and line-oriented diff hunks.",
@@ -1098,7 +1155,9 @@ func FilePatchTool() *Tool {
 			"dry_run":         {Type: "boolean", Description: "Preview the patch plan without changing the filesystem. Default false.", Required: false, Default: false},
 			"expected_sha256": {Type: "string", Description: "Optional SHA-256 hash the existing file must match before patching.", Required: false},
 		},
-		Handler: handleFilePatch,
+		Handler: func(args map[string]any) (string, error) {
+			return handleFilePatchWithPolicy(args, policy)
+		},
 	}
 }
 
@@ -1114,7 +1173,11 @@ type filePatchPlan struct {
 }
 
 func handleFilePatch(args map[string]any) (string, error) {
-	path, pathErr := resolvePathArg(args, "path")
+	return handleFilePatchWithPolicy(args, DefaultFilesystemPolicy())
+}
+
+func handleFilePatchWithPolicy(args map[string]any, policy FilesystemPolicy) (string, error) {
+	path, pathErr := resolveWritePathArg(args, "path", policy)
 	match, _ := args["match"].(string)
 	replace, replaceProvided := args["replace"].(string)
 	diffText, _ := args["diff"].(string)
@@ -1147,7 +1210,7 @@ func handleFilePatch(args map[string]any) (string, error) {
 
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("stat file: %w", err)
+		return "", filesystemPathError("stat file", path, err)
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("file_patch expects a file, got directory: %s", path)
@@ -1480,12 +1543,12 @@ func handleFileListWithPolicy(args map[string]any, policy FilesystemPolicy) (str
 			return nil
 		})
 		if err != nil && !errors.Is(err, stopWalk) {
-			return "", fmt.Errorf("walk directory: %w", err)
+			return "", filesystemPathError("walk directory", path, err)
 		}
 	} else {
 		entries, err := os.ReadDir(path)
 		if err != nil {
-			return "", fmt.Errorf("read directory: %w", err)
+			return "", filesystemPathError("read directory", path, err)
 		}
 		for _, entry := range entries {
 			if entryCount >= maxEntries {
@@ -1525,12 +1588,16 @@ func containsInvalidPathChars(path string) bool {
 }
 
 func resolvePathArg(args map[string]any, key string) (string, error) {
+	return resolveWritePathArg(args, key, DefaultFilesystemPolicy())
+}
+
+func resolveWritePathArg(args map[string]any, key string, policy FilesystemPolicy) (string, error) {
 	path, ok := args[key].(string)
 	if !ok || strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("%s is required", key)
 	}
 	cwd, _ := args["_cwd"].(string)
-	return resolvePathForOperation(path, cwd, "", filesystemPolicyFromArgs(args, DefaultFilesystemPolicy()))
+	return resolvePathForOperation(path, cwd, filesystemWrite, filesystemPolicyFromArgs(args, policy))
 }
 
 func resolveReadPathArg(args map[string]any, key string, policy FilesystemPolicy) (string, error) {
@@ -1557,16 +1624,11 @@ func resolvePath(path, baseCwd string) (string, error) {
 func resolvePathForOperation(path, baseCwd string, op filesystemOperation, policy FilesystemPolicy) (string, error) {
 	path = expandSandboxPath(strings.TrimSpace(path))
 	clean := filepath.Clean(path)
-	if strings.Contains(clean, "..") {
-		return "", fmt.Errorf("path traversal detected: %s", path)
-	}
 	if !filepath.IsAbs(clean) {
 		baseCwd = expandSandboxPath(strings.TrimSpace(baseCwd))
 		if baseCwd != "" {
 			baseCwd = filepath.Clean(baseCwd)
-			if err := validateSandboxForOperation(baseCwd, op, policy); err == nil {
-				clean = filepath.Join(baseCwd, clean)
-			}
+			clean = filepath.Join(baseCwd, clean)
 		}
 	}
 	if !filepath.IsAbs(clean) {
@@ -1608,76 +1670,149 @@ func validateSandbox(cleanPath string) error {
 }
 
 func validateSandboxForOperation(cleanPath string, op filesystemOperation, policy FilesystemPolicy) error {
-	normalizedRequested := strings.ReplaceAll(cleanPath, `\`, `/`)
-	if normalizedRequested == "/dev/null" || strings.HasPrefix(normalizedRequested, "/tmp/") {
+	if cleanPath == "/dev/null" || strings.EqualFold(cleanPath, os.DevNull) {
 		return nil
 	}
-
 	absPath := normalizeFilesystemCandidate(cleanPath)
-
+	lexicalPath := normalizeSandboxPath(absoluteFilesystemPath(cleanPath))
 	home := sandboxHomeDir()
-	tempDir := normalizeSandboxPath(os.TempDir())
-	allowedPrefixes := []string{
-		normalizeSandboxPath(filepath.Join(home, ".luckyagent")),
-		tempDir,
-		normalizeSandboxPath(os.DevNull),
-	}
-	if filepath.Base(home) == ".lh-home" {
-		allowedPrefixes = append(allowedPrefixes, normalizeSandboxPath(home))
-	}
 	deniedPrefixes := []string{
-		normalizeSandboxPath(filepath.Join(home, ".nanobot")),
-		normalizeSandboxPath(filepath.Join(home, ".ssh")),
-		normalizeSandboxPath(filepath.Join(home, ".gnupg")),
-		normalizeSandboxPath(filepath.Join(home, ".aws")),
-		normalizeSandboxPath(filepath.Join(home, ".config", "gcloud")),
-		normalizeSandboxPath(filepath.Join(home, "AppData", "Roaming", "gcloud")),
-		normalizeSandboxPath("/etc/shadow"),
-		normalizeSandboxPath("/etc/ssh"),
+		filepath.Join(home, ".nanobot"), filepath.Join(home, ".ssh"),
+		filepath.Join(home, ".gnupg"), filepath.Join(home, ".aws"),
+		filepath.Join(home, ".config", "gcloud"), filepath.Join(home, "AppData", "Roaming", "gcloud"),
+		"/etc/shadow", "/etc/ssh",
 	}
 	for _, denied := range deniedPrefixes {
-		if pathMatchesPrefix(absPath, denied) {
-			return fmt.Errorf("access denied: path is outside sandbox (%s)", cleanPath)
+		if pathMatchesPrefix(absPath, normalizeFilesystemRoot(denied)) ||
+			pathMatchesPrefix(lexicalPath, normalizeSandboxPath(absoluteFilesystemPath(denied))) {
+			return filesystemSandboxDenied(cleanPath, op, policy, "restricted path")
 		}
 	}
 	if policy.AllowOutsideSandbox {
 		return nil
 	}
-	for _, allowed := range allowedPrefixes {
+	for _, allowed := range filesystemAllowedRoots(op, policy) {
 		if pathMatchesPrefix(absPath, allowed) {
 			return nil
 		}
 	}
+	return filesystemSandboxDenied(cleanPath, op, policy, "path is outside allowed roots")
+}
+
+func filesystemAllowedRoots(op filesystemOperation, policy FilesystemPolicy) []string {
+	home := sandboxHomeDir()
+	roots := []string{filepath.Join(home, ".luckyagent"), os.TempDir(), os.DevNull}
+	if runtime.GOOS != "windows" {
+		// Keep the legacy /tmp allowance even when TMPDIR points elsewhere.
+		roots = append(roots, "/tmp")
+	}
+	if filepath.Base(home) == ".lh-home" {
+		roots = append(roots, home)
+	}
 	if op == filesystemRead {
-		for _, root := range policy.AllowedReadRoots {
-			allowed := normalizeFilesystemRoot(root)
-			if allowed != "" && pathMatchesPrefix(absPath, allowed) {
-				return nil
-			}
+		roots = append(roots, policy.AllowedReadRoots...)
+	}
+	roots = append(roots, policy.AllowedWriteRoots...)
+	var normalized []string
+	seen := make(map[string]bool)
+	for _, root := range roots {
+		root = normalizeFilesystemRoot(root)
+		if root != "" && !seen[root] {
+			normalized = append(normalized, root)
+			seen[root] = true
 		}
 	}
-	return fmt.Errorf("access denied: path is outside sandbox (allowed: ~/.luckyagent/, /tmp/; add tools.filesystem.allowed_read_roots for read-only paths, then restart). Requested: %s", cleanPath)
+	return normalized
+}
+
+func filesystemSandboxDenied(path string, op filesystemOperation, policy FilesystemPolicy, reason string) error {
+	if op == "" {
+		op = filesystemWrite
+	}
+	return fmt.Errorf("access denied: path is outside sandbox (%s; operation=%s; %s). Requested: %s",
+		reason, op, filesystemPolicyDescription(policy), path)
+}
+
+func filesystemPolicyDescription(policy FilesystemPolicy) string {
+	return fmt.Sprintf("allow_outside_sandbox=%t; allowed_read_roots=%q; allowed_write_roots=%q; configure tools.filesystem.allowed_read_roots for reads or tools.filesystem.allowed_write_roots for writes",
+		policy.AllowOutsideSandbox, filesystemAllowedRoots(filesystemRead, policy), filesystemAllowedRoots(filesystemWrite, policy))
+}
+
+func absoluteFilesystemPath(path string) string {
+	path = expandSandboxPath(strings.TrimSpace(path))
+	if !filepath.IsAbs(path) {
+		if wd, err := os.Getwd(); err == nil {
+			path = filepath.Join(wd, path)
+		}
+	}
+	return filepath.Clean(path)
 }
 
 func normalizeFilesystemCandidate(path string) string {
-	absPath := expandSandboxPath(strings.TrimSpace(path))
-	if !filepath.IsAbs(absPath) {
-		if wd, err := os.Getwd(); err == nil {
-			absPath = filepath.Join(wd, absPath)
+	return normalizeSandboxPath(resolveFilesystemAncestors(absoluteFilesystemPath(path)))
+}
+
+// Resolve the existing ancestors of a new output too. EvalSymlinks alone cannot
+// validate a new leaf reached through a directory symlink. This is a preflight,
+// not a race-proof openat/OS sandbox boundary.
+func resolveFilesystemAncestors(path string) string {
+	for hops := 0; hops < 40; hops++ {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return resolved
+		}
+		cursor := path
+		var suffix []string
+		changed := false
+		for {
+			info, err := os.Lstat(cursor)
+			if err == nil && info.Mode()&os.ModeSymlink != 0 {
+				target, readErr := os.Readlink(cursor)
+				if readErr != nil {
+					return path
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(cursor), target)
+				}
+				path = appendFilesystemSuffix(target, suffix)
+				changed = true
+				break
+			}
+			if resolved, err := filepath.EvalSymlinks(cursor); err == nil {
+				return appendFilesystemSuffix(resolved, suffix)
+			}
+			parent := filepath.Dir(cursor)
+			if parent == cursor {
+				return path
+			}
+			suffix = append(suffix, filepath.Base(cursor))
+			cursor = parent
+		}
+		if !changed {
+			return path
 		}
 	}
-	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
-		absPath = resolved
+	return path
+}
+
+func appendFilesystemSuffix(base string, reversed []string) string {
+	for i := len(reversed) - 1; i >= 0; i-- {
+		base = filepath.Join(base, reversed[i])
 	}
-	return normalizeSandboxPath(absPath)
+	return base
 }
 
 func normalizeFilesystemRoot(root string) string {
-	root = strings.TrimSpace(root)
-	if root == "" {
+	if strings.TrimSpace(root) == "" {
 		return ""
 	}
 	return normalizeFilesystemCandidate(root)
+}
+
+func filesystemPathError(action, path string, err error) error {
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("not_found: %s %q: %w", action, path, err)
+	}
+	return fmt.Errorf("%s %q: %w", action, path, err)
 }
 
 func sandboxHomeDir() string {

@@ -8,8 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,28 +28,30 @@ import (
 )
 
 const (
-	defaultLogTailMaxBytes   = 64 << 10
-	maxLogTailBytes          = 1 << 20
-	logTailReadBlockBytes    = 32 << 10
-	defaultLogGrepOutputByte = 64 << 10
-	maxLogGrepOutputBytes    = 1 << 20
-	defaultLogGrepScanLines  = 1_000_000
-	maxLogGrepScanLines      = 10_000_000
-	maxLogScannerTokenBytes  = 10 << 20
-	defaultStructuredMaxFile = 20 << 20
-	maxStructuredFileBytes   = 100 << 20
-	defaultStructuredOutput  = 12000
-	maxStructuredOutput      = 1 << 20
-	maxStructuredQueryChars  = 2048
-	defaultCSVMaxScanRows    = 100_000
-	maxCSVMaxScanRows        = 1_000_000
-	defaultSQLTimeoutSeconds = 10
-	maxSQLTimeoutSeconds     = 60
-	defaultDBSchemaTableMax  = 100
-	maxDBSchemaTableMax      = 1000
-	maxHTTPRequestBodyBytes  = 1 << 20
-	defaultHTTPResponseBytes = 32 << 10
-	maxHTTPResponseBytes     = 1 << 20
+	defaultLogTailMaxBytes    = 64 << 10
+	maxLogTailBytes           = 1 << 20
+	logTailReadBlockBytes     = 32 << 10
+	defaultLogGrepOutputByte  = 64 << 10
+	maxLogGrepOutputBytes     = 1 << 20
+	defaultLogGrepScanLines   = 1_000_000
+	maxLogGrepScanLines       = 10_000_000
+	maxLogScannerTokenBytes   = 10 << 20
+	defaultStructuredMaxFile  = 20 << 20
+	maxStructuredFileBytes    = 100 << 20
+	defaultStructuredOutput   = 12000
+	maxStructuredOutput       = 1 << 20
+	maxStructuredQueryChars   = 2048
+	defaultCSVMaxScanRows     = 100_000
+	maxCSVMaxScanRows         = 1_000_000
+	defaultSQLTimeoutSeconds  = 10
+	maxSQLTimeoutSeconds      = 60
+	defaultDBSchemaTableMax   = 100
+	maxDBSchemaTableMax       = 1000
+	maxHTTPRequestBodyBytes   = 1 << 20
+	defaultHTTPResponseBytes  = 32 << 10
+	maxHTTPResponseBytes      = 1 << 20
+	defaultHTTPTimeoutSeconds = 30
+	maxHTTPTimeoutSeconds     = 120
 )
 
 // DataTool reads logs and structured files through one entry.
@@ -476,7 +480,7 @@ func HTTPRequestTool() *Tool {
 			"method":             {Type: "string", Description: "HTTP method. GET, HEAD, and OPTIONS are allowed by default; mutation methods require allow_mutation=true.", Required: false, Default: "GET"},
 			"headers_json":       {Type: "string", Description: "Optional JSON object of request headers.", Required: false},
 			"body":               {Type: "string", Description: "Optional request body, max 1 MiB.", Required: false},
-			"timeout":            {Type: "number", Description: "Timeout in seconds (default 15, max 60).", Required: false, Default: 15},
+			"timeout":            {Type: "number", Description: "Timeout in seconds (default 30, max 120).", Required: false, Default: defaultHTTPTimeoutSeconds},
 			"allow_mutation":     {Type: "boolean", Description: "Allow POST, PUT, PATCH, or DELETE.", Required: false, Default: false},
 			"max_response_bytes": {Type: "number", Description: "Maximum response bytes to read (default 32768, max 1048576).", Required: false, Default: defaultHTTPResponseBytes},
 			"format":             {Type: "string", Description: "Output format: text or json. Default text.", Required: false, Default: "text"},
@@ -489,6 +493,7 @@ func HTTPRequestTool() *Tool {
 }
 
 func handleHTTPRequest(args map[string]any) (string, error) {
+	started := time.Now()
 	rawURL, ok := args["url"].(string)
 	if !ok || strings.TrimSpace(rawURL) == "" {
 		return "", fmt.Errorf("url is required")
@@ -504,7 +509,7 @@ func handleHTTPRequest(args map[string]any) (string, error) {
 	if err := validateHTTPMethod(method, allowMutation); err != nil {
 		return "", err
 	}
-	timeout := boundedIntArg(args, "timeout", 15, 1, 60)
+	timeout := boundedIntArg(args, "timeout", defaultHTTPTimeoutSeconds, 1, maxHTTPTimeoutSeconds)
 	maxResponseBytes := boundedIntArg(args, "max_response_bytes", defaultHTTPResponseBytes, 1, maxHTTPResponseBytes)
 	format := strings.ToLower(strings.TrimSpace(stringValue(args["format"])))
 	if format == "" {
@@ -554,15 +559,28 @@ func handleHTTPRequest(args map[string]any) (string, error) {
 			return nil
 		},
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("send request: %w", err)
+	resp, requestErr := client.Do(req)
+	var data []byte
+	if resp != nil {
+		defer resp.Body.Close()
 	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxResponseBytes)+1))
-	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+	if requestErr == nil {
+		data, requestErr = io.ReadAll(io.LimitReader(resp.Body, int64(maxResponseBytes)+1))
+	}
+	elapsed := time.Since(started)
+	bytesRead := len(data)
+	partial := requestErr != nil && bytesRead > 0
+	timedOut := requestTimedOut(requestErr)
+	requestStatus := "success"
+	if requestErr != nil {
+		requestStatus = "error"
+		if timedOut {
+			requestStatus = "timeout"
+		}
+		if partial {
+			requestStatus = "partial"
+		}
+		requestErr = fmt.Errorf("http_request failed (status=%s, timeout_seconds=%d, elapsed=%s, bytes_read=%d): %w", requestStatus, timeout, elapsed.Round(time.Millisecond), bytesRead, requestErr)
 	}
 	truncated := len(data) > maxResponseBytes
 	if truncated {
@@ -581,34 +599,60 @@ func handleHTTPRequest(args map[string]any) (string, error) {
 	}
 	if format == "json" {
 		result := map[string]any{
-			"status":         resp.Status,
-			"status_code":    resp.StatusCode,
-			"content_type":   resp.Header.Get("Content-Type"),
-			"bytes_read":     len(data),
-			"response_limit": maxResponseBytes,
-			"truncated":      truncated,
+			"request_status":  requestStatus,
+			"bytes_read":      bytesRead,
+			"response_limit":  maxResponseBytes,
+			"truncated":       truncated,
+			"partial":         partial,
+			"timed_out":       timedOut,
+			"timeout_seconds": timeout,
+			"elapsed":         elapsed.Round(time.Millisecond).String(),
+			"elapsed_ms":      elapsed.Milliseconds(),
+		}
+		if resp != nil {
+			result["status"] = resp.Status
+			result["status_code"] = resp.StatusCode
+			result["content_type"] = resp.Header.Get("Content-Type")
+		}
+		if requestErr != nil {
+			result["error"] = requestErr.Error()
 		}
 		if bodyIsJSON {
 			result["body"] = jsonBody
 		} else {
 			result["body"] = bodyText
 		}
-		if includeHeaders {
+		if includeHeaders && resp != nil {
 			result["headers"] = responseHeaders(resp.Header, redactHeaders)
 		}
-		return prettyStructuredValue(result)
+		out, formatErr := prettyStructuredValue(result)
+		if formatErr != nil {
+			return "", formatErr
+		}
+		return out, requestErr
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Status: %s\n", resp.Status))
-	if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" {
-		b.WriteString("Content-Type: " + ct + "\n")
+	if resp != nil {
+		b.WriteString(fmt.Sprintf("Status: %s\n", resp.Status))
+		if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" {
+			b.WriteString("Content-Type: " + ct + "\n")
+		}
 	}
-	b.WriteString(fmt.Sprintf("Bytes-Read: %d\n", len(data)))
+	b.WriteString(fmt.Sprintf("Request-Status: %s\nTimeout-Seconds: %d\nElapsed: %s\nBytes-Read: %d\n", requestStatus, timeout, elapsed.Round(time.Millisecond), bytesRead))
+	if partial {
+		b.WriteString("Partial: true\n")
+	}
+	if timedOut {
+		b.WriteString("Timed-Out: true\n")
+	}
+	if requestErr != nil {
+		b.WriteString("Error: " + requestErr.Error() + "\n")
+	}
 	if truncated {
 		b.WriteString(fmt.Sprintf("Truncated: true (limit %d bytes)\n", maxResponseBytes))
 	}
-	if includeHeaders {
+	if includeHeaders && resp != nil {
 		b.WriteString("Headers:\n")
 		headers := responseHeaders(resp.Header, redactHeaders)
 		names := make([]string, 0, len(headers))
@@ -624,7 +668,15 @@ func handleHTTPRequest(args map[string]any) (string, error) {
 		b.WriteString("\n")
 		b.WriteString(utils.Truncate(bodyText, 12000))
 	}
-	return strings.TrimSpace(b.String()), nil
+	return strings.TrimSpace(b.String()), requestErr
+}
+
+func requestTimedOut(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 func validateHTTPMethod(method string, allowMutation bool) error {

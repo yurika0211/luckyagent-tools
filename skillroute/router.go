@@ -27,6 +27,28 @@ type Result struct {
 // Match returns nil when no strong, unambiguous match exists. Index refers to
 // the caller's original descriptor slice, including empty descriptors.
 func Match(userInput string, skills []Descriptor) *Result {
+	matches := Matches(userInput, skills)
+	if len(matches) == 0 {
+		return nil
+	}
+	best := matches[0]
+	if best.Explicit {
+		return best
+	}
+	if best.Score < 3 {
+		return nil
+	}
+	if len(matches) > 1 && best.Score <= matches[1].Score {
+		return nil
+	}
+	return best
+}
+
+// Matches returns every scored candidate in descending preference order. It
+// deliberately does not apply Match's ambiguity filter: callers that need a
+// safe comparison (for example, an idempotent dual run) must see the tied
+// candidates rather than silently receiving no result.
+func Matches(userInput string, skills []Descriptor) []*Result {
 	input := strings.TrimSpace(strings.ToLower(userInput))
 	if input == "" || len(skills) == 0 {
 		return nil
@@ -60,17 +82,7 @@ func Match(userInput string, skills []Descriptor) *Result {
 		}
 		return strings.Compare(a.Skill.Name, b.Skill.Name)
 	})
-	best := matches[0]
-	if best.Explicit {
-		return best
-	}
-	if best.Score < 3 {
-		return nil
-	}
-	if len(matches) > 1 && best.Score <= matches[1].Score {
-		return nil
-	}
-	return best
+	return matches
 }
 
 func filterNonEmpty(values []string) []string {

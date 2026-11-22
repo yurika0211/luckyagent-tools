@@ -35,3 +35,17 @@ func TestMatchingAndAmbiguity(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchesPreservesTiedCandidatesForComparison(t *testing.T) {
+	skills := []Descriptor{
+		{Name: "alpha", Description: "evidence sources"},
+		{Name: "beta", Description: "evidence sources"},
+	}
+	got := Matches("collect evidence and sources", skills)
+	if len(got) != 2 {
+		t.Fatalf("Matches returned %d candidates, want 2: %+v", len(got), got)
+	}
+	if Match("collect evidence and sources", skills) != nil {
+		t.Fatal("Match should retain its ambiguity-safe nil result")
+	}
+}

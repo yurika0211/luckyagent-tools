@@ -17,23 +17,25 @@ type PersistedState struct {
 }
 
 type PersistedJob struct {
-	ID             string               `json:"id"`
-	ScheduleText   string               `json:"schedule_text"`
-	Command        string               `json:"command"`
-	Mode           string               `json:"mode"`
-	Paused         bool                 `json:"paused"`
-	Status         string               `json:"status,omitempty"`
-	RunCount       int                  `json:"run_count,omitempty"`
-	ErrorCount     int                  `json:"error_count,omitempty"`
-	LastError      string               `json:"last_error,omitempty"`
-	CreatedAtUnix  int64                `json:"created_at_unix,omitempty"`
-	UpdatedAtUnix  int64                `json:"updated_at_unix,omitempty"`
-	LastRunUnix    int64                `json:"last_run_unix,omitempty"`
-	NextRunUnix    int64                `json:"next_run_unix,omitempty"`
-	DeleteAfterRun bool                 `json:"delete_after_run,omitempty"`
-	Schedule       *PersistedSchedule   `json:"schedule,omitempty"`
-	RunHistory     []PersistedRunRecord `json:"run_history,omitempty"`
-	Metadata       map[string]string    `json:"metadata,omitempty"`
+	ID              string               `json:"id"`
+	ScheduleText    string               `json:"schedule_text"`
+	Command         string               `json:"command"`
+	Mode            string               `json:"mode"`
+	Paused          bool                 `json:"paused"`
+	Status          string               `json:"status,omitempty"`
+	RunCount        int                  `json:"run_count,omitempty"`
+	ErrorCount      int                  `json:"error_count,omitempty"`
+	LastError       string               `json:"last_error,omitempty"`
+	CreatedAtUnix   int64                `json:"created_at_unix,omitempty"`
+	UpdatedAtUnix   int64                `json:"updated_at_unix,omitempty"`
+	LastRunUnix     int64                `json:"last_run_unix,omitempty"`
+	NextRunUnix     int64                `json:"next_run_unix,omitempty"`
+	NextRunUnixNano int64                `json:"next_run_unix_nano,omitempty"`
+	DeleteAfterRun  bool                 `json:"delete_after_run,omitempty"`
+	ClaimedSlots    []int64              `json:"claimed_slots,omitempty"`
+	Schedule        *PersistedSchedule   `json:"schedule,omitempty"`
+	RunHistory      []PersistedRunRecord `json:"run_history,omitempty"`
+	Metadata        map[string]string    `json:"metadata,omitempty"`
 }
 
 type PersistedSchedule struct {
@@ -92,23 +94,25 @@ func (s *Store) Save(engine *Engine) error {
 			mode = "shell"
 		}
 		state.Jobs = append(state.Jobs, PersistedJob{
-			ID:             job.ID,
-			ScheduleText:   scheduleText,
-			Command:        command,
-			Mode:           mode,
-			Paused:         job.Status == StatusPaused,
-			Status:         job.Status.String(),
-			RunCount:       job.RunCount,
-			ErrorCount:     job.ErrorCount,
-			LastError:      job.LastError,
-			CreatedAtUnix:  unixOrZero(job.CreatedAt),
-			UpdatedAtUnix:  unixOrZero(job.UpdatedAt),
-			LastRunUnix:    unixOrZero(job.LastRun),
-			NextRunUnix:    unixOrZero(job.NextRun),
-			DeleteAfterRun: job.DeleteAfterRun,
-			Schedule:       serializeSchedule(job.Schedule),
-			RunHistory:     serializeRunHistory(job.RunHistory),
-			Metadata:       copyMetadata(job.Metadata),
+			ID:              job.ID,
+			ScheduleText:    scheduleText,
+			Command:         command,
+			Mode:            mode,
+			Paused:          job.Status == StatusPaused,
+			Status:          job.Status.String(),
+			RunCount:        job.RunCount,
+			ErrorCount:      job.ErrorCount,
+			LastError:       job.LastError,
+			CreatedAtUnix:   unixOrZero(job.CreatedAt),
+			UpdatedAtUnix:   unixOrZero(job.UpdatedAt),
+			LastRunUnix:     unixOrZero(job.LastRun),
+			NextRunUnix:     unixOrZero(job.NextRun),
+			NextRunUnixNano: unixNanoOrZero(job.NextRun),
+			DeleteAfterRun:  job.DeleteAfterRun,
+			ClaimedSlots:    serializeClaimedSlots(job.claimedSlots),
+			Schedule:        serializeSchedule(job.Schedule),
+			RunHistory:      serializeRunHistory(job.RunHistory),
+			Metadata:        copyMetadata(job.Metadata),
 		})
 	}
 
@@ -289,8 +293,15 @@ func (s *Store) writeMarkdown(state PersistedState) error {
 		if job.NextRunUnix > 0 {
 			b.WriteString(fmt.Sprintf("next_run_unix: %d\n", job.NextRunUnix))
 		}
+		if job.NextRunUnixNano > 0 {
+			b.WriteString(fmt.Sprintf("next_run_unix_nano: %d\n", job.NextRunUnixNano))
+		}
 		if job.DeleteAfterRun {
 			b.WriteString("delete_after_run: true\n")
+		}
+		if len(job.ClaimedSlots) > 0 {
+			claimedSlotsJSON, _ := json.Marshal(job.ClaimedSlots)
+			b.WriteString(fmt.Sprintf("claimed_slots: %s\n", string(claimedSlotsJSON)))
 		}
 		if job.Schedule != nil {
 			scheduleJSON, _ := json.Marshal(job.Schedule)
@@ -374,8 +385,15 @@ func parseMarkdownState(content string) (PersistedState, error) {
 					_, _ = fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "last_run_unix:")), "%d", &pj.LastRunUnix)
 				case strings.HasPrefix(trimmed, "next_run_unix:"):
 					_, _ = fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "next_run_unix:")), "%d", &pj.NextRunUnix)
+				case strings.HasPrefix(trimmed, "next_run_unix_nano:"):
+					_, _ = fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(trimmed, "next_run_unix_nano:")), "%d", &pj.NextRunUnixNano)
 				case strings.HasPrefix(trimmed, "delete_after_run:"):
 					pj.DeleteAfterRun = strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(trimmed, "delete_after_run:")), "true")
+				case strings.HasPrefix(trimmed, "claimed_slots:"):
+					raw := strings.TrimSpace(strings.TrimPrefix(trimmed, "claimed_slots:"))
+					if raw != "" && raw != "null" {
+						_ = json.Unmarshal([]byte(raw), &pj.ClaimedSlots)
+					}
 				case strings.HasPrefix(trimmed, "schedule_def:"):
 					raw := strings.TrimSpace(strings.TrimPrefix(trimmed, "schedule_def:"))
 					if raw != "" && raw != "null" {
@@ -466,7 +484,7 @@ func buildRestoredJobState(job PersistedJob) RestoredJobState {
 		Status:         job.Status,
 		Paused:         job.Paused,
 		LastRun:        unixPtr(job.LastRunUnix),
-		NextRun:        unixPtr(job.NextRunUnix),
+		NextRun:        unixNanoPtrOrMilli(job.NextRunUnixNano, job.NextRunUnix),
 		RunCount:       job.RunCount,
 		ErrorCount:     job.ErrorCount,
 		LastError:      job.LastError,
@@ -474,7 +492,20 @@ func buildRestoredJobState(job PersistedJob) RestoredJobState {
 		UpdatedAt:      unixPtr(job.UpdatedAtUnix),
 		RunHistory:     restoreRunHistory(job.RunHistory),
 		DeleteAfterRun: job.DeleteAfterRun,
+		ClaimedSlots:   append([]int64(nil), job.ClaimedSlots...),
 	}
+}
+
+func serializeClaimedSlots(claimedSlots map[int64]struct{}) []int64 {
+	if len(claimedSlots) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(claimedSlots))
+	for slot := range claimedSlots {
+		out = append(out, slot)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func normalizeRestoredJobState(schedule Schedule, state RestoredJobState, now time.Time) RestoredJobState {
@@ -519,6 +550,21 @@ func unixPtr(ms int64) *time.Time {
 	}
 	t := time.UnixMilli(ms)
 	return &t
+}
+
+func unixNanoOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func unixNanoPtrOrMilli(ns, ms int64) *time.Time {
+	if ns > 0 {
+		t := time.Unix(0, ns)
+		return &t
+	}
+	return unixPtr(ms)
 }
 
 func cronExprString(s CronSchedule) string {

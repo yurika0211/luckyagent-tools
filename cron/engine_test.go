@@ -396,6 +396,45 @@ func TestClaimSlotRejectsASecondWorkerAndAPausedJob(t *testing.T) {
 	}
 }
 
+func TestClaimSlotDistinguishesSubsecondSlots(t *testing.T) {
+	e := NewEngine()
+	firstSlot := time.Now().Add(-2 * time.Second).Truncate(time.Second).Add(100 * time.Millisecond)
+	secondSlot := firstSlot.Add(200 * time.Millisecond)
+	if err := e.AddJob("task", "Task", "desc", fixedSchedule{at: firstSlot}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.claimSlot("task"); !ok {
+		t.Fatal("first subsecond slot was not claimed")
+	}
+	e.mu.Lock()
+	e.jobs["task"].Status = StatusIdle
+	e.jobs["task"].NextRun = secondSlot
+	e.mu.Unlock()
+	if claimed, ok := e.claimSlot("task"); !ok || !claimed.Equal(secondSlot) {
+		t.Fatalf("second subsecond slot = %v, %t", claimed, ok)
+	}
+}
+
+func TestRestoreJobStatePreservesClaimsForPartialState(t *testing.T) {
+	e := NewEngine()
+	planned := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	if err := e.AddJob("task", "Task", "desc", fixedSchedule{at: planned}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.claimSlot("task"); !ok {
+		t.Fatal("initial slot was not claimed")
+	}
+	e.mu.Lock()
+	e.jobs["task"].Status = StatusIdle
+	e.mu.Unlock()
+	if err := e.RestoreJobState("task", RestoredJobState{Status: StatusIdle.String(), NextRun: &planned}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.claimSlot("task"); ok {
+		t.Fatal("partial state restore reopened an already claimed slot")
+	}
+}
+
 type fixedSchedule struct{ at time.Time }
 
 func (s fixedSchedule) Next(time.Time) time.Time { return s.at }

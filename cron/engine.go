@@ -377,6 +377,7 @@ func (e *Engine) GetJob(id string) (*Job, bool) {
 	}
 	// 返回副本避免外部修改
 	copy := *job
+	copy.claimedSlots = cloneClaimedSlots(job.claimedSlots)
 	return &copy, true
 }
 
@@ -388,9 +389,21 @@ func (e *Engine) ListJobs() []*Job {
 	var jobs []*Job
 	for _, job := range e.jobs {
 		copy := *job
+		copy.claimedSlots = cloneClaimedSlots(job.claimedSlots)
 		jobs = append(jobs, &copy)
 	}
 	return jobs
+}
+
+func cloneClaimedSlots(src map[int64]struct{}) map[int64]struct{} {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[int64]struct{}, len(src))
+	for slot := range src {
+		out[slot] = struct{}{}
+	}
+	return out
 }
 
 // Start 启动调度引擎
@@ -521,7 +534,7 @@ func (e *Engine) claimSlot(jobID string) (scheduledAt time.Time, ok bool) {
 	if !exists || job.Status == StatusRunning || job.Status == StatusPaused || job.NextRun.IsZero() {
 		return time.Time{}, false
 	}
-	slot := job.NextRun.Unix()
+	slot := job.NextRun.UnixNano()
 	if job.claimedSlots == nil {
 		job.claimedSlots = map[int64]struct{}{}
 	}
@@ -594,6 +607,17 @@ func (e *Engine) executeJob(jobID string, now time.Time) {
 	if len(job.RunHistory) > maxRunHistory {
 		job.RunHistory = append([]RunRecord(nil), job.RunHistory[len(job.RunHistory)-maxRunHistory:]...)
 	}
+	// Keep enough claim history to cover the retained execution history. Older
+	// slots can no longer be replayed by this in-memory engine.
+	keep := make(map[int64]struct{}, len(job.RunHistory))
+	for _, item := range job.RunHistory {
+		keep[item.RunAt.UnixNano()] = struct{}{}
+	}
+	for slot := range job.claimedSlots {
+		if _, ok := keep[slot]; !ok {
+			delete(job.claimedSlots, slot)
+		}
+	}
 	job.UpdatedAt = finishedAt
 	if job.DeleteAfterRun && job.NextRun.IsZero() {
 		delete(e.jobs, jobID)
@@ -662,6 +686,10 @@ func (e *Engine) RestoreJobState(id string, state RestoredJobState) error {
 	job.LastError = state.LastError
 	job.RunHistory = append([]RunRecord(nil), state.RunHistory...)
 	job.DeleteAfterRun = state.DeleteAfterRun
+	job.claimedSlots = make(map[int64]struct{}, len(state.ClaimedSlots))
+	for _, slot := range state.ClaimedSlots {
+		job.claimedSlots[slot] = struct{}{}
+	}
 
 	switch {
 	case state.Paused:
@@ -707,6 +735,7 @@ type RestoredJobState struct {
 	UpdatedAt      *time.Time
 	RunHistory     []RunRecord
 	DeleteAfterRun bool
+	ClaimedSlots   []int64
 }
 
 // emit 发送事件

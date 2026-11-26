@@ -480,7 +480,7 @@ func (s *ResultStore) PendingForDevice(deviceID string, limit int) ([]Delivery, 
 	}
 	items := make([]item, 0)
 	for _, delivery := range s.state.Deliveries {
-		if delivery.Channel != device.Channel || (delivery.Status != DeliveryPending && delivery.Status != DeliveryRetrying) {
+		if delivery.Channel != device.Channel || (delivery.Status != DeliveryPending && delivery.Status != DeliveryRetrying && delivery.Status != DeliveryDelivered) {
 			continue
 		}
 		execution, exists := s.executionLocked(delivery.ExecutionID)
@@ -491,12 +491,17 @@ func (s *ResultStore) PendingForDevice(deviceID string, limit int) ([]Delivery, 
 		if !exists || task.Status == TaskDeleted || execution.Status == ExecutionRunning {
 			continue
 		}
-		if !execution.ScheduledAt.After(device.CursorAt) {
+		if !executionAfterCursor(execution, device) {
 			continue
 		}
 		items = append(items, item{delivery: delivery, exec: execution})
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].exec.ScheduledAt.After(items[j].exec.ScheduledAt) })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].exec.ScheduledAt.Equal(items[j].exec.ScheduledAt) {
+			return items[i].exec.ID > items[j].exec.ID
+		}
+		return items[i].exec.ScheduledAt.After(items[j].exec.ScheduledAt)
+	})
 	if len(items) > limit {
 		items = items[:limit]
 	}
@@ -516,7 +521,8 @@ func (s *ResultStore) Ack(deliveryID, deviceID string, at time.Time) (Delivery, 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.deviceLocked(strings.TrimSpace(deviceID)); !ok {
+	device, ok := s.deviceLocked(strings.TrimSpace(deviceID))
+	if !ok {
 		return Delivery{}, ErrResultNotFound
 	}
 	idx := s.deliveryIndexLocked(strings.TrimSpace(deliveryID))
@@ -534,7 +540,7 @@ func (s *ResultStore) Ack(deliveryID, deviceID string, at time.Time) (Delivery, 
 	if execution, ok := s.executionLocked(delivery.ExecutionID); ok {
 		for i := range s.state.Devices {
 			if s.state.Devices[i].ID == strings.TrimSpace(deviceID) {
-				if execution.ScheduledAt.After(s.state.Devices[i].CursorAt) || execution.ID == s.state.Devices[i].CursorExecutionID {
+				if executionAfterCursor(execution, device) {
 					s.state.Devices[i].CursorAt = execution.ScheduledAt
 					s.state.Devices[i].CursorExecutionID = execution.ID
 				}
@@ -543,6 +549,18 @@ func (s *ResultStore) Ack(deliveryID, deviceID string, at time.Time) (Delivery, 
 		}
 	}
 	return delivery, s.persistLocked()
+}
+
+func executionAfterCursor(execution Execution, device Device) bool {
+	if execution.ScheduledAt.After(device.CursorAt) {
+		return true
+	}
+	if !execution.ScheduledAt.Equal(device.CursorAt) {
+		return false
+	}
+	// Results are scanned newest first. For a tied scheduled slot, IDs below
+	// the last acknowledged ID are the older rows still inside that slot.
+	return device.CursorExecutionID == "" || execution.ID < device.CursorExecutionID
 }
 
 func (s *ResultStore) PauseTask(taskID string) error { return s.setTaskStatus(taskID, TaskPaused) }

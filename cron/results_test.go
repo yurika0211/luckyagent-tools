@@ -89,6 +89,50 @@ func TestResultStorePausedDeletedAndAckSemantics(t *testing.T) {
 	}
 }
 
+func TestResultStoreDeviceCursorKeepsDeliveredAndTiedSlots(t *testing.T) {
+	s := NewMemoryResultStore()
+	for _, id := range []string{"task-a", "task-b"} {
+		if _, err := s.EnsureTask(Task{ID: id, Channels: []string{"android"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	phone, err := s.RegisterDevice(Device{ID: "phone", Channel: "android"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterDevice(Device{ID: "tablet", Channel: "android"}); err != nil {
+		t.Fatal(err)
+	}
+	scheduled := time.Date(2026, 11, 27, 8, 0, 0, 0, time.UTC)
+	executions := make([]Execution, 0, 2)
+	for _, taskID := range []string{"task-a", "task-b"} {
+		execution, claimed, claimErr := s.Claim(taskID, scheduled, scheduled.Add(time.Minute))
+		if claimErr != nil || !claimed {
+			t.Fatalf("claim %s = %#v, %t, %v", taskID, execution, claimed, claimErr)
+		}
+		finished, completeErr := s.Complete(execution.ID, taskID, nil, scheduled.Add(2*time.Minute))
+		if completeErr != nil {
+			t.Fatal(completeErr)
+		}
+		executions = append(executions, finished)
+	}
+	first, err := s.PendingForDevice(phone.ID, 1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first pending = %#v, %v", first, err)
+	}
+	if _, err := s.Ack(first[0].ID, phone.ID, scheduled.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.PendingForDevice(phone.ID, 1)
+	if err != nil || len(second) != 1 || second[0].ExecutionID == first[0].ExecutionID {
+		t.Fatalf("tied pending = %#v, %v (executions=%#v)", second, err, executions)
+	}
+	all, err := s.PendingForDevice("tablet", 10)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("other device pending delivered rows = %#v, %v", all, err)
+	}
+}
+
 func TestResultStoreConcurrentClaimAndReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "results.json")
 	s, err := NewResultStore(path)

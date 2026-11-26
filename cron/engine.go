@@ -57,6 +57,9 @@ type Job struct {
 	RunHistory     []RunRecord
 	DeleteAfterRun bool
 	Metadata       map[string]string // v0.44.0: 自定义元数据（如 chatID, triggerType 等）
+	// claimedSlots records scheduled_at values already claimed for this job.
+	// The key is the planned time, not the time the worker noticed it.
+	claimedSlots map[int64]struct{}
 }
 
 // RunRecord 单次执行记录
@@ -504,21 +507,50 @@ func (e *Engine) tick(now time.Time) {
 	}
 }
 
+// claimSlot marks one planned time as taken. A second worker for the same
+// (job, scheduled_at) gets false and must not run. Paused and deleted jobs
+// cannot be claimed. The planned time is job.NextRun, not the clock time.
+func (e *Engine) claimSlot(jobID string) (scheduledAt time.Time, ok bool) {
+	if e == nil {
+		return time.Time{}, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, exists := e.jobs[jobID]
+	if !exists || job.Status == StatusRunning || job.Status == StatusPaused || job.NextRun.IsZero() {
+		return time.Time{}, false
+	}
+	slot := job.NextRun.Unix()
+	if job.claimedSlots == nil {
+		job.claimedSlots = map[int64]struct{}{}
+	}
+	if _, taken := job.claimedSlots[slot]; taken {
+		return time.Time{}, false
+	}
+	job.claimedSlots[slot] = struct{}{}
+	job.Status = StatusRunning
+	job.LastRun = job.NextRun
+	job.UpdatedAt = time.Now()
+	return job.NextRun, true
+}
+
 // executeJob 执行任务
 func (e *Engine) executeJob(jobID string, now time.Time) {
-	e.mu.Lock()
-	job, exists := e.jobs[jobID]
-	if !exists || job.Status == StatusRunning || job.Status == StatusPaused {
-		e.mu.Unlock()
+	scheduledAt, claimed := e.claimSlot(jobID)
+	if !claimed {
 		return
 	}
-	job.Status = StatusRunning
-	job.LastRun = now
-	job.UpdatedAt = now
+	e.mu.RLock()
+	job, exists := e.jobs[jobID]
+	if !exists {
+		e.mu.RUnlock()
+		return
+	}
 	jobName := job.Name
 	jobMeta := job.Metadata
 	task := job.Task
-	e.mu.Unlock()
+	e.mu.RUnlock()
+	_ = now
 
 	e.emit(Event{Type: EventJobStarted, JobID: jobID, JobName: jobName, Time: now, Metadata: jobMeta})
 
@@ -535,7 +567,7 @@ func (e *Engine) executeJob(jobID string, now time.Time) {
 	}
 	job.RunCount++
 	record := RunRecord{
-		RunAt:    now,
+		RunAt:    scheduledAt,
 		Duration: finishedAt.Sub(startedAt),
 	}
 	if err != nil {

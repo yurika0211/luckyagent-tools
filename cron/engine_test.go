@@ -365,6 +365,42 @@ func TestEngineJobFailure(t *testing.T) {
 	}
 }
 
+func TestClaimSlotRejectsASecondWorkerAndAPausedJob(t *testing.T) {
+	e := NewEngine()
+	planned := time.Now().Add(-time.Second).Truncate(time.Second)
+	if err := e.AddJob("task", "Task", "desc", fixedSchedule{at: planned}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := e.claimSlot("task")
+	if !ok || !first.Equal(planned) {
+		t.Fatalf("first claim = %v ok=%v", first, ok)
+	}
+	if _, ok := e.claimSlot("task"); ok {
+		t.Fatal("second worker claimed the same slot")
+	}
+	e.mu.Lock()
+	e.jobs["task"].Status = StatusIdle
+	e.jobs["task"].NextRun = planned
+	e.mu.Unlock()
+	if _, ok := e.claimSlot("task"); ok {
+		t.Fatal("same scheduled_at was claimed again")
+	}
+
+	next := planned.Add(time.Minute)
+	e.mu.Lock()
+	e.jobs["task"].NextRun = next
+	e.jobs["task"].Status = StatusPaused
+	e.mu.Unlock()
+	if _, ok := e.claimSlot("task"); ok {
+		t.Fatal("paused job was claimed")
+	}
+}
+
+type fixedSchedule struct{ at time.Time }
+
+func (s fixedSchedule) Next(time.Time) time.Time { return s.at }
+func (s fixedSchedule) String() string           { return "fixed" }
+
 // immediateSchedule 立即触发的调度（用于测试）
 type immediateSchedule struct{}
 

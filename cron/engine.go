@@ -224,12 +224,13 @@ type Engine struct {
 
 // Event 调度事件
 type Event struct {
-	Type     EventType
-	JobID    string
-	JobName  string
-	Time     time.Time
-	Error    error
-	Metadata map[string]string // v0.44.0: 从 Job 透传的元数据
+	Type        EventType
+	JobID       string
+	JobName     string
+	Time        time.Time
+	ScheduledAt time.Time
+	Error       error
+	Metadata    map[string]string // v0.44.0: 从 Job 透传的元数据
 }
 
 // EventType 事件类型
@@ -552,7 +553,7 @@ func (e *Engine) executeJob(jobID string, now time.Time) {
 	e.mu.RUnlock()
 	_ = now
 
-	e.emit(Event{Type: EventJobStarted, JobID: jobID, JobName: jobName, Time: now, Metadata: jobMeta})
+	e.emit(Event{Type: EventJobStarted, JobID: jobID, JobName: jobName, Time: now, ScheduledAt: scheduledAt, Metadata: jobMeta})
 
 	// 执行任务
 	startedAt := time.Now()
@@ -602,9 +603,9 @@ func (e *Engine) executeJob(jobID string, now time.Time) {
 
 	// 在锁外发送事件
 	if err != nil {
-		e.emit(Event{Type: EventJobFailed, JobID: jobID, JobName: jobName, Time: time.Now(), Error: err, Metadata: jobMeta})
+		e.emit(Event{Type: EventJobFailed, JobID: jobID, JobName: jobName, Time: time.Now(), ScheduledAt: scheduledAt, Error: err, Metadata: jobMeta})
 	} else {
-		e.emit(Event{Type: EventJobCompleted, JobID: jobID, JobName: jobName, Time: time.Now(), Metadata: jobMeta})
+		e.emit(Event{Type: EventJobCompleted, JobID: jobID, JobName: jobName, Time: time.Now(), ScheduledAt: scheduledAt, Metadata: jobMeta})
 	}
 }
 

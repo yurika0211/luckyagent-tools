@@ -390,6 +390,15 @@ func (s *ResultStore) ListExecutions(taskID string) []Execution {
 	return out
 }
 
+func (s *ResultStore) GetExecution(executionID string) (Execution, bool) {
+	if s == nil {
+		return Execution{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.executionLocked(strings.TrimSpace(executionID))
+}
+
 func (s *ResultStore) ListDeliveries(executionID string) []Delivery {
 	if s == nil {
 		return nil

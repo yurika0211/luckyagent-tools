@@ -133,6 +133,45 @@ func TestResultStoreDeviceCursorKeepsDeliveredAndTiedSlots(t *testing.T) {
 	}
 }
 
+func TestResultStoreAckValidatesDeviceChannelAndCancelledDelivery(t *testing.T) {
+	s := NewMemoryResultStore()
+	if _, err := s.EnsureTask(Task{ID: "task-1", Channels: []string{"android"}}); err != nil {
+		t.Fatal(err)
+	}
+	execution, claimed, err := s.Claim("task-1", time.Date(2026, 11, 27, 8, 0, 0, 0, time.UTC), time.Now().UTC())
+	if err != nil || !claimed {
+		t.Fatalf("claim = %#v, %t, %v", execution, claimed, err)
+	}
+	if _, err := s.Complete(execution.ID, "ok", nil, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	deliveries := s.ListDeliveries(execution.ID)
+	if len(deliveries) != 1 {
+		t.Fatalf("deliveries = %#v", deliveries)
+	}
+	if _, err := s.RegisterDevice(Device{ID: "phone", Channel: "android"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterDevice(Device{ID: "tablet", Channel: "telegram"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Ack(deliveries[0].ID, "tablet", time.Now().UTC()); !errors.Is(err, ErrInvalidResult) {
+		t.Fatalf("cross-channel ack error = %v", err)
+	}
+	if got := s.ListDeliveries(execution.ID)[0].Status; got != DeliveryPending {
+		t.Fatalf("cross-channel ack changed status = %s", got)
+	}
+	if err := s.DeleteTask("task-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Ack(deliveries[0].ID, "phone", time.Now().UTC()); !errors.Is(err, ErrResultNotFound) {
+		t.Fatalf("cancelled ack error = %v", err)
+	}
+	if got := s.ListDeliveries(execution.ID)[0].Status; got != DeliveryCancelled {
+		t.Fatalf("cancelled ack changed status = %s", got)
+	}
+}
+
 func TestResultStoreConcurrentClaimAndReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "results.json")
 	s, err := NewResultStore(path)

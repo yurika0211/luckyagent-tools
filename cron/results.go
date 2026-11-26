@@ -516,20 +516,28 @@ func (s *ResultStore) Ack(deliveryID, deviceID string, at time.Time) (Delivery, 
 	if s == nil || strings.TrimSpace(deliveryID) == "" || strings.TrimSpace(deviceID) == "" {
 		return Delivery{}, ErrInvalidResult
 	}
+	deliveryID = strings.TrimSpace(deliveryID)
+	deviceID = strings.TrimSpace(deviceID)
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	device, ok := s.deviceLocked(strings.TrimSpace(deviceID))
+	device, ok := s.deviceLocked(deviceID)
 	if !ok {
 		return Delivery{}, ErrResultNotFound
 	}
-	idx := s.deliveryIndexLocked(strings.TrimSpace(deliveryID))
+	idx := s.deliveryIndexLocked(deliveryID)
 	if idx < 0 {
 		return Delivery{}, ErrResultNotFound
 	}
 	delivery := s.state.Deliveries[idx]
+	if delivery.Channel != device.Channel {
+		return Delivery{}, ErrInvalidResult
+	}
+	if delivery.Status == DeliveryCancelled {
+		return Delivery{}, ErrResultNotFound
+	}
 	if delivery.Status != DeliveryDelivered {
 		delivery.Status = DeliveryDelivered
 		delivery.Attempts++
@@ -539,7 +547,7 @@ func (s *ResultStore) Ack(deliveryID, deviceID string, at time.Time) (Delivery, 
 	}
 	if execution, ok := s.executionLocked(delivery.ExecutionID); ok {
 		for i := range s.state.Devices {
-			if s.state.Devices[i].ID == strings.TrimSpace(deviceID) {
+			if s.state.Devices[i].ID == deviceID {
 				if executionAfterCursor(execution, device) {
 					s.state.Devices[i].CursorAt = execution.ScheduledAt
 					s.state.Devices[i].CursorExecutionID = execution.ID

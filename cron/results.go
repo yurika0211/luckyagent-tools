@@ -491,7 +491,7 @@ func (s *ResultStore) PendingForDevice(deviceID string, limit int) ([]Delivery, 
 		if !exists || task.Status == TaskDeleted || execution.Status == ExecutionRunning {
 			continue
 		}
-		if !execution.ScheduledAt.After(device.CursorAt) && execution.ID == device.CursorExecutionID {
+		if !execution.ScheduledAt.After(device.CursorAt) {
 			continue
 		}
 		items = append(items, item{delivery: delivery, exec: execution})

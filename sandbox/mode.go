@@ -483,6 +483,9 @@ func (s *Snapshot) command(ctx context.Context, command, workdir string, env map
 	if runtime.GOOS == "windows" {
 		return nil, errors.New("restricted sandbox requires bubblewrap on a Linux host")
 	}
+	if err := requireProbe(s); err != nil {
+		return nil, err
+	}
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {
 		return nil, fmt.Errorf("restricted sandbox requires bubblewrap: %w", err)

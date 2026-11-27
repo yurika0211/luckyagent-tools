@@ -215,3 +215,88 @@ func TestResultStoreConcurrentClaimAndReload(t *testing.T) {
 		t.Fatalf("reloaded executions=%#v", got)
 	}
 }
+
+func TestResultStoreBlockedOnlyWhenEveryDeviceReportsUnavailable(t *testing.T) {
+	s := NewMemoryResultStore()
+	if _, err := s.EnsureTask(Task{ID: "task-1", Channels: []string{"android"}}); err != nil {
+		t.Fatal(err)
+	}
+	scheduled := time.Date(2026, 11, 27, 8, 0, 0, 0, time.UTC)
+	claimAndFinish := func(at time.Time) Execution {
+		t.Helper()
+		execution, claimed, err := s.Claim("task-1", at, at)
+		if err != nil || !claimed {
+			t.Fatalf("claim = %#v, %t, %v", execution, claimed, err)
+		}
+		finished, err := s.Complete(execution.ID, "ok", nil, at.Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return finished
+	}
+
+	none := claimAndFinish(scheduled)
+	if got := s.ListDeliveries(none.ID)[0].Status; got != DeliveryPending {
+		t.Fatalf("no device status = %s", got)
+	}
+
+	if _, err := s.RegisterDevice(Device{ID: "offline", Channel: "android"}); err != nil {
+		t.Fatal(err)
+	}
+	unknown := claimAndFinish(scheduled.Add(time.Hour))
+	if got := s.ListDeliveries(unknown.ID)[0].Status; got != DeliveryPending {
+		t.Fatalf("unknown capability status = %s", got)
+	}
+
+	if _, err := s.RegisterDevice(Device{
+		ID: "phone", Channel: "android", CapabilityKnown: true,
+		NotificationsEnabled: false, ChannelEnabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListDeliveries(none.ID)[0].Status; got != DeliveryPending {
+		t.Fatalf("one unknown device became blocked: %s", got)
+	}
+
+	if _, err := s.RegisterDevice(Device{ID: "offline", Channel: "android", CapabilityKnown: true, NotificationsEnabled: false, ChannelEnabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListDeliveries(none.ID)[0].Status; got != DeliveryBlocked {
+		t.Fatalf("all explicit unavailable status = %s", got)
+	}
+	if got := s.ListDeliveries(unknown.ID)[0].Status; got != DeliveryBlocked {
+		t.Fatalf("second delivery status = %s", got)
+	}
+
+	blocked, err := s.PendingForDevice("phone", 1)
+	if err != nil || len(blocked) != 0 {
+		t.Fatalf("blocked pending = %#v, %v", blocked, err)
+	}
+
+	created := claimAndFinish(scheduled.Add(2 * time.Hour))
+	if got := s.ListDeliveries(created.ID)[0].Status; got != DeliveryBlocked {
+		t.Fatalf("created while blocked = %s", got)
+	}
+
+	if _, err := s.RegisterDevice(Device{
+		ID: "tablet", Channel: "android", FCMToken: "token",
+		CapabilityKnown: true, NotificationsEnabled: true, ChannelEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListDeliveries(none.ID)[0].Status; got != DeliveryBlocked {
+		t.Fatalf("recovered permission reopened delivery: %s", got)
+	}
+	if _, err := s.Ack(s.ListDeliveries(none.ID)[0].ID, "tablet", scheduled.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListDeliveries(none.ID)[0].Status; got != DeliveryDelivered {
+		t.Fatalf("ack from blocked = %s", got)
+	}
+	if _, err := s.RegisterDevice(Device{ID: "tablet", Channel: "android", CapabilityKnown: true, NotificationsEnabled: false, ChannelEnabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ListDeliveries(none.ID)[0].Status; got != DeliveryDelivered {
+		t.Fatalf("later capability changed delivered: %s", got)
+	}
+}

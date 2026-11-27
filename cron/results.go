@@ -748,9 +748,13 @@ func executionAfterCursor(execution Execution, device Device) bool {
 	return device.CursorExecutionID == "" || execution.ID < device.CursorExecutionID
 }
 
-func (s *ResultStore) PauseTask(taskID string) error { return s.setTaskStatus(taskID, TaskPaused) }
+func (s *ResultStore) PauseTask(taskID string) error { return s.setTaskStatus(taskID, TaskPaused, time.Time{}) }
 
-func (s *ResultStore) ResumeTask(taskID string) error { return s.setTaskStatus(taskID, TaskActive) }
+// ResumeTask marks the task active and stores the next planned time. The
+// caller passes the time computed from now, so missed slots stay unclaimed.
+func (s *ResultStore) ResumeTask(taskID string, nextRun time.Time) error {
+	return s.setTaskStatus(taskID, TaskActive, nextRun)
+}
 
 func (s *ResultStore) DeleteTask(taskID string) error {
 	if s == nil {
@@ -777,7 +781,7 @@ func (s *ResultStore) DeleteTask(taskID string) error {
 	return s.persistLocked()
 }
 
-func (s *ResultStore) setTaskStatus(taskID string, status TaskStatus) error {
+func (s *ResultStore) setTaskStatus(taskID string, status TaskStatus, nextRun time.Time) error {
 	if s == nil {
 		return ErrResultNotFound
 	}
@@ -791,6 +795,9 @@ func (s *ResultStore) setTaskStatus(taskID string, status TaskStatus) error {
 		return ErrTaskDeleted
 	}
 	s.state.Tasks[idx].Status = status
+	if !nextRun.IsZero() {
+		s.state.Tasks[idx].NextRunAt = nextRun.UTC()
+	}
 	s.state.Tasks[idx].UpdatedAt = time.Now().UTC()
 	return s.persistLocked()
 }

@@ -20,6 +20,7 @@ type CronToolService struct {
 	engine    *cronpkg.Engine
 	save      CronSaveFunc
 	buildTask CronTaskFactory
+	results   *cronpkg.ResultStore
 }
 
 // NewCronToolService creates a cron tool service.
@@ -29,6 +30,15 @@ func NewCronToolService(engine *cronpkg.Engine, save CronSaveFunc, buildTask Cro
 		save:      save,
 		buildTask: buildTask,
 	}
+}
+
+// SetResultStore keeps the account-visible task status next to the scheduler.
+// Pause and resume write both. A nil store leaves the scheduler-only path.
+func (s *CronToolService) SetResultStore(results *cronpkg.ResultStore) {
+	if s == nil {
+		return
+	}
+	s.results = results
 }
 
 // RegisterTools registers cron-related tools onto the registry.
@@ -308,6 +318,14 @@ func (s *CronToolService) HandlePause(args map[string]any) (string, error) {
 	if err := s.engine.PauseJob(id); err != nil {
 		return "", err
 	}
+	if s.results != nil {
+		if _, err := s.results.EnsureTask(cronpkg.Task{ID: id}); err != nil {
+			return "", err
+		}
+		if err := s.results.PauseTask(id); err != nil {
+			return "", err
+		}
+	}
 	if s.save != nil {
 		if err := s.save(); err != nil {
 			return "", err
@@ -326,6 +344,18 @@ func (s *CronToolService) HandleResume(args map[string]any) (string, error) {
 	}
 	if err := s.engine.ResumeJob(id); err != nil {
 		return "", err
+	}
+	if s.results != nil {
+		next, err := s.engine.NextRunAfterResume(id, time.Now())
+		if err != nil {
+			return "", err
+		}
+		if _, err := s.results.EnsureTask(cronpkg.Task{ID: id}); err != nil {
+			return "", err
+		}
+		if err := s.results.ResumeTask(id, next); err != nil {
+			return "", err
+		}
 	}
 	if s.save != nil {
 		if err := s.save(); err != nil {

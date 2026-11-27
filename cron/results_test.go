@@ -47,8 +47,13 @@ func TestResultStorePausedDeletedAndAckSemantics(t *testing.T) {
 	if _, _, err := s.Claim("task-1", time.Now().UTC(), time.Now().UTC()); !errors.Is(err, ErrTaskPaused) {
 		t.Fatalf("paused claim error = %v", err)
 	}
-	if err := s.ResumeTask("task-1"); err != nil {
+	next := time.Now().UTC().Add(30 * time.Minute)
+	if err := s.ResumeTask("task-1", next); err != nil {
 		t.Fatal(err)
+	}
+	resumed, ok := s.GetTask("task-1")
+	if !ok || !resumed.NextRunAt.Equal(next) || resumed.Status != TaskActive {
+		t.Fatalf("resume = %#v, %t", resumed, ok)
 	}
 	execution, claimed, err := s.Claim("task-1", time.Now().UTC().Add(time.Hour), time.Now().UTC())
 	if err != nil || !claimed {

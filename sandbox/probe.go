@@ -54,16 +54,37 @@ func ProbeIsolation() error {
 	cmd.Stderr = &output
 	if err := cmd.Run(); err != nil {
 		detail := strings.TrimSpace(output.String())
-		reason := "namespace permission denied"
-		if strings.Contains(detail, "mount") || strings.Contains(detail, "bind") {
-			reason = "mount failed"
-		}
 		if detail == "" {
 			detail = err.Error()
 		}
-		return Probe{Reason: reason, Detail: detail}
+		return Probe{Reason: classifyProbeFailure(detail), Detail: detail}
 	}
 	return nil
+}
+
+// classifyProbeFailure names the four cases the contract requires a caller to
+// tell apart. It does not change AppArmor, users, or sudo. A refused user
+// namespace stays "namespace permission denied" so it is not reported as a
+// working isolation boundary.
+func classifyProbeFailure(detail string) string {
+	lower := strings.ToLower(detail)
+	switch {
+	case strings.Contains(lower, "mount"),
+		strings.Contains(lower, "bind"):
+		return "mount failed"
+	case strings.Contains(lower, "executable file not found"),
+		strings.Contains(lower, "bwrap: not found"):
+		return "bubblewrap missing"
+	case strings.Contains(lower, "setpcap"),
+		strings.Contains(lower, "net_admin"),
+		strings.Contains(lower, "uid map"),
+		strings.Contains(lower, "apparmor"),
+		strings.Contains(lower, "permission denied"),
+		strings.Contains(lower, "operation not permitted"):
+		return "namespace permission denied"
+	default:
+		return "trusted exec unavailable"
+	}
 }
 
 // requireProbe blocks a restricted command when the fixed check fails.

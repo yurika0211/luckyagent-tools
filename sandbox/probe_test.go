@@ -19,6 +19,24 @@ func TestProbeDoesNotAcceptAUserCommand(t *testing.T) {
 	}
 }
 
+func TestClassifyProbeFailureSeparatesTheFourCases(t *testing.T) {
+	cases := []struct {
+		detail string
+		reason string
+	}{
+		{"exec: bwrap: executable file not found in $PATH", "bubblewrap missing"},
+		{"bwrap: setting up uid map: Permission denied", "namespace permission denied"},
+		{"bwrap: No permissions to creating new namespace, likely because unprivileged_userns AppArmor policy", "namespace permission denied"},
+		{"bwrap: Can't bind mount: no such file", "mount failed"},
+		{"sandbox process exited before the barrier", "trusted exec unavailable"},
+	}
+	for _, tc := range cases {
+		if got := classifyProbeFailure(tc.detail); got != tc.reason {
+			t.Fatalf("classify(%q) = %q, want %q", tc.detail, got, tc.reason)
+		}
+	}
+}
+
 func TestDevModeDoesNotRequireProbe(t *testing.T) {
 	if err := requireProbe(&Snapshot{Mode: ModeDev}); err != nil {
 		t.Fatal(err)

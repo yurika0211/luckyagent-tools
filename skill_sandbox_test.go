@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"os/exec"
 	"testing"
 	"time"
 )
@@ -394,6 +395,89 @@ func TestSandboxExecuteWithContext(t *testing.T) {
 	}
 	if result != "context ok" {
 		t.Errorf("expected 'context ok', got %s", result)
+	}
+}
+
+func TestCancelStopsTrackedSkillProcessAndLeavesTheOtherSandbox(t *testing.T) {
+	reg := NewRegistry()
+	a := NewSkillSandbox(reg, DefaultSandboxConfig())
+	b := NewSkillSandbox(NewRegistry(), DefaultSandboxConfig())
+	release := make(chan struct{})
+	tracked := make(chan [2]*exec.Cmd, 1)
+	reg.Register(&Tool{
+		Name:       "holds_child",
+		Category:   CatSkill,
+		Source:     "test",
+		Permission: PermAuto,
+		Enabled:    true,
+		Handler: func(map[string]any) (string, error) {
+			cmdA := exec.Command("sleep", "30")
+			cmdB := exec.Command("sleep", "30")
+			if err := cmdA.Start(); err != nil {
+				return "", err
+			}
+			if err := cmdB.Start(); err != nil {
+				_ = cmdA.Process.Kill()
+				return "", err
+			}
+			a.Track(cmdA)
+			b.Track(cmdB)
+			tracked <- [2]*exec.Cmd{cmdA, cmdB}
+			<-release
+			err := cmdA.Wait()
+			if cmdB.Process != nil {
+				_ = cmdB.Process.Kill()
+			}
+			return "done", err
+		},
+	})
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() {
+		_, err := a.ExecuteWithContext(ctx, "holds_child", nil)
+		finished <- err
+	}()
+	var children [2]*exec.Cmd
+	select {
+	case children = <-tracked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler did not track both children before cancel")
+	}
+	cmdA, cmdB := children[0], children[1]
+	defer func() {
+		if cmdB.Process != nil {
+			_ = cmdB.Process.Kill()
+		}
+	}()
+	cancel()
+
+	select {
+	case err := <-finished:
+		if err == nil {
+			t.Fatal("cancelling sandbox A returned success")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ExecuteWithContext did not return after cancel")
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmdA.Wait() }()
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sandbox A left its tracked process running")
+	}
+	alive := make(chan struct{})
+	go func() {
+		_ = cmdB.Wait()
+		close(alive)
+	}()
+	select {
+	case <-alive:
+		t.Fatal("cancelling sandbox A stopped sandbox B")
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 

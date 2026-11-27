@@ -49,6 +49,7 @@ type DeliveryStatus string
 const (
 	DeliveryPending   DeliveryStatus = "pending"
 	DeliveryRetrying  DeliveryStatus = "retrying"
+	DeliveryBlocked   DeliveryStatus = "blocked"
 	DeliveryDelivered DeliveryStatus = "delivered"
 	DeliveryCancelled DeliveryStatus = "cancelled"
 )
@@ -93,15 +94,19 @@ type Delivery struct {
 // Device is a client capability registration.  Cursor is local-device state;
 // it is intentionally not used to mutate account-level Delivery status.
 type Device struct {
-	ID                   string    `json:"id"`
-	Channel              string    `json:"channel"`
-	FCMToken             string    `json:"fcm_token,omitempty"`
-	NotificationsEnabled bool      `json:"notifications_enabled"`
-	ChannelEnabled       bool      `json:"channel_enabled"`
-	RegisteredAt         time.Time `json:"registered_at"`
-	CursorAt             time.Time `json:"cursor_at,omitempty"`
-	CursorExecutionID    string    `json:"cursor_execution_id,omitempty"`
-	LastCapabilityAt     time.Time `json:"last_capability_at,omitempty"`
+	ID                   string `json:"id"`
+	Channel              string `json:"channel"`
+	FCMToken             string `json:"fcm_token,omitempty"`
+	NotificationsEnabled bool   `json:"notifications_enabled"`
+	ChannelEnabled       bool   `json:"channel_enabled"`
+	// CapabilityKnown is true only after this device reports whether
+	// notifications can be shown. A missing token, an offline device, or a
+	// registration that has not reported yet is not a negative report.
+	CapabilityKnown   bool      `json:"capability_known"`
+	RegisteredAt      time.Time `json:"registered_at"`
+	CursorAt          time.Time `json:"cursor_at,omitempty"`
+	CursorExecutionID string    `json:"cursor_execution_id,omitempty"`
+	LastCapabilityAt  time.Time `json:"last_capability_at,omitempty"`
 }
 
 type ResultState struct {
@@ -333,7 +338,7 @@ func (s *ResultStore) Complete(executionID string, result string, failed error, 
 			if s.deliveryIndexLocked(id) >= 0 {
 				continue
 			}
-			s.state.Deliveries = append(s.state.Deliveries, Delivery{ID: id, ExecutionID: execution.ID, Channel: channel, Status: DeliveryPending, CreatedAt: finishedAt.UTC(), UpdatedAt: finishedAt.UTC()})
+			s.state.Deliveries = append(s.state.Deliveries, Delivery{ID: id, ExecutionID: execution.ID, Channel: channel, Status: s.deliveryStatusForChannelLocked(channel), CreatedAt: finishedAt.UTC(), UpdatedAt: finishedAt.UTC()})
 		}
 	}
 	if err := s.persistLocked(); err != nil {
@@ -424,12 +429,13 @@ func (s *ResultStore) RegisterDevice(device Device) (Device, error) {
 	if device.Channel == "" {
 		device.Channel = "android"
 	}
-	if device.RegisteredAt.IsZero() {
-		device.RegisteredAt = time.Now().UTC()
-	}
-	device.LastCapabilityAt = time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if device.RegisteredAt.IsZero() {
+		device.RegisteredAt = now
+	}
+	device.LastCapabilityAt = now
 	for i := range s.state.Devices {
 		if s.state.Devices[i].ID != device.ID {
 			continue
@@ -438,10 +444,64 @@ func (s *ResultStore) RegisterDevice(device Device) (Device, error) {
 		device.CursorExecutionID = s.state.Devices[i].CursorExecutionID
 		device.RegisteredAt = s.state.Devices[i].RegisteredAt
 		s.state.Devices[i] = device
+		s.refreshDeliveryCapabilityLocked(device.Channel, device.LastCapabilityAt)
 		return device, s.persistLocked()
 	}
 	s.state.Devices = append(s.state.Devices, device)
+	s.refreshDeliveryCapabilityLocked(device.Channel, device.LastCapabilityAt)
 	return device, s.persistLocked()
+}
+
+// deliveryStatusForChannelLocked applies the capability rule at creation.
+// No registered device, an unknown capability, or a missing token stays
+// pending. blocked is only for a channel where every registered device has
+// explicitly reported that notifications cannot be shown.
+func (s *ResultStore) deliveryStatusForChannelLocked(channel string) DeliveryStatus {
+	if channelBlockedLocked(s.state.Devices, channel) {
+		return DeliveryBlocked
+	}
+	return DeliveryPending
+}
+
+func channelBlockedLocked(devices []Device, channel string) bool {
+	seen := 0
+	for _, device := range devices {
+		if device.Channel != channel {
+			continue
+		}
+		seen++
+		if !device.CapabilityKnown || deviceCanNotify(device) {
+			return false
+		}
+	}
+	return seen > 0
+}
+
+func deviceCanNotify(device Device) bool {
+	return device.NotificationsEnabled && device.ChannelEnabled
+}
+
+// refreshDeliveryCapabilityLocked moves pending and retrying rows to blocked
+// only when every registered device on that channel has reported that it
+// cannot notify. A later ACK is the only path back to delivered. Recovered
+// permission does not send again and does not return the row to pending.
+func (s *ResultStore) refreshDeliveryCapabilityLocked(channel string, at time.Time) {
+	if !channelBlockedLocked(s.state.Devices, channel) {
+		return
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	for i := range s.state.Deliveries {
+		if s.state.Deliveries[i].Channel != channel {
+			continue
+		}
+		switch s.state.Deliveries[i].Status {
+		case DeliveryPending, DeliveryRetrying:
+			s.state.Deliveries[i].Status = DeliveryBlocked
+			s.state.Deliveries[i].UpdatedAt = at.UTC()
+		}
+	}
 }
 
 func (s *ResultStore) GetDevice(deviceID string) (Device, bool) {
@@ -481,6 +541,9 @@ func (s *ResultStore) PendingForDevice(deviceID string, limit int) ([]Delivery, 
 	items := make([]item, 0)
 	for _, delivery := range s.state.Deliveries {
 		if delivery.Channel != device.Channel || (delivery.Status != DeliveryPending && delivery.Status != DeliveryRetrying && delivery.Status != DeliveryDelivered) {
+			continue
+		}
+		if channelBlockedLocked(s.state.Devices, device.Channel) && delivery.Status != DeliveryDelivered {
 			continue
 		}
 		execution, exists := s.executionLocked(delivery.ExecutionID)
@@ -559,6 +622,120 @@ func (s *ResultStore) Ack(deliveryID, deviceID string, at time.Time) (Delivery, 
 	return delivery, s.persistLocked()
 }
 
+// FCMPush is one data message. Acceptance by the transport is not delivery.
+// The client still has to submit the system notification and ACK.
+type FCMPush struct {
+	DeviceID    string
+	Token       string
+	TaskID      string
+	ExecutionID string
+	DeliveryID  string
+	Summary     string
+}
+
+// FCMSender accepts a data message. A nil sender means no transport is
+// configured. The store never treats a successful send as delivered.
+type FCMSender interface {
+	Send(FCMPush) error
+}
+
+// DispatchAndroidFCM sends the data message for one Android delivery to every
+// registered device that has a token and can notify. It runs only after the
+// result transaction has committed, so the caller invokes it after Complete
+// returns. No registered device leaves the row pending and sends nothing.
+// A blocked row is not pushed. One device ACK already stopped retries.
+// A transport error marks the row retrying. It does not change the Execution.
+func (s *ResultStore) DispatchAndroidFCM(executionID string, sender FCMSender, at time.Time) ([]FCMPush, error) {
+	if s == nil || strings.TrimSpace(executionID) == "" {
+		return nil, ErrInvalidResult
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	execution, ok := s.executionLocked(strings.TrimSpace(executionID))
+	if !ok {
+		return nil, ErrResultNotFound
+	}
+	if execution.Status == ExecutionRunning {
+		return nil, ErrInvalidResult
+	}
+	idx := -1
+	for i, delivery := range s.state.Deliveries {
+		if delivery.ExecutionID == execution.ID && delivery.Channel == "android" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, nil
+	}
+	delivery := s.state.Deliveries[idx]
+	switch delivery.Status {
+	case DeliveryDelivered, DeliveryCancelled, DeliveryBlocked:
+		return nil, nil
+	case DeliveryPending, DeliveryRetrying:
+	default:
+		return nil, nil
+	}
+	if channelBlockedLocked(s.state.Devices, "android") {
+		return nil, nil
+	}
+	task, _ := s.taskLocked(execution.TaskID)
+	summary := execution.Result
+	if execution.Status == ExecutionFailed && execution.Error != "" {
+		summary = execution.Error
+	}
+	pushes := make([]FCMPush, 0)
+	for _, device := range s.state.Devices {
+		if device.Channel != "android" || strings.TrimSpace(device.FCMToken) == "" {
+			continue
+		}
+		if device.CapabilityKnown && !deviceCanNotify(device) {
+			continue
+		}
+		pushes = append(pushes, FCMPush{
+			DeviceID:    device.ID,
+			Token:       device.FCMToken,
+			TaskID:      task.ID,
+			ExecutionID: execution.ID,
+			DeliveryID:  delivery.ID,
+			Summary:     summary,
+		})
+	}
+	if len(pushes) == 0 {
+		return nil, nil
+	}
+	if sender == nil {
+		return nil, errors.New("fcm sender is not configured")
+	}
+	var sendErr error
+	sent := make([]FCMPush, 0, len(pushes))
+	for _, push := range pushes {
+		if err := sender.Send(push); err != nil {
+			sendErr = err
+			continue
+		}
+		sent = append(sent, push)
+	}
+	if sendErr != nil {
+		delivery.Status = DeliveryRetrying
+		delivery.Attempts++
+		delivery.LastError = sendErr.Error()
+		delivery.UpdatedAt = at.UTC()
+		s.state.Deliveries[idx] = delivery
+		if err := s.persistLocked(); err != nil {
+			return sent, err
+		}
+		return sent, sendErr
+	}
+	delivery.LastError = ""
+	delivery.UpdatedAt = at.UTC()
+	s.state.Deliveries[idx] = delivery
+	return sent, s.persistLocked()
+}
+
 func executionAfterCursor(execution Execution, device Device) bool {
 	if execution.ScheduledAt.After(device.CursorAt) {
 		return true
@@ -571,9 +748,13 @@ func executionAfterCursor(execution Execution, device Device) bool {
 	return device.CursorExecutionID == "" || execution.ID < device.CursorExecutionID
 }
 
-func (s *ResultStore) PauseTask(taskID string) error { return s.setTaskStatus(taskID, TaskPaused) }
+func (s *ResultStore) PauseTask(taskID string) error { return s.setTaskStatus(taskID, TaskPaused, time.Time{}) }
 
-func (s *ResultStore) ResumeTask(taskID string) error { return s.setTaskStatus(taskID, TaskActive) }
+// ResumeTask marks the task active and stores the next planned time. The
+// caller passes the time computed from now, so missed slots stay unclaimed.
+func (s *ResultStore) ResumeTask(taskID string, nextRun time.Time) error {
+	return s.setTaskStatus(taskID, TaskActive, nextRun)
+}
 
 func (s *ResultStore) DeleteTask(taskID string) error {
 	if s == nil {
@@ -590,7 +771,7 @@ func (s *ResultStore) DeleteTask(taskID string) error {
 	task.UpdatedAt = time.Now().UTC()
 	s.state.Tasks[idx] = task
 	for i := range s.state.Deliveries {
-		if s.state.Deliveries[i].Status == DeliveryPending || s.state.Deliveries[i].Status == DeliveryRetrying {
+		if s.state.Deliveries[i].Status == DeliveryPending || s.state.Deliveries[i].Status == DeliveryRetrying || s.state.Deliveries[i].Status == DeliveryBlocked {
 			if execution, ok := s.executionLocked(s.state.Deliveries[i].ExecutionID); ok && execution.TaskID == task.ID {
 				s.state.Deliveries[i].Status = DeliveryCancelled
 				s.state.Deliveries[i].UpdatedAt = task.UpdatedAt
@@ -600,7 +781,7 @@ func (s *ResultStore) DeleteTask(taskID string) error {
 	return s.persistLocked()
 }
 
-func (s *ResultStore) setTaskStatus(taskID string, status TaskStatus) error {
+func (s *ResultStore) setTaskStatus(taskID string, status TaskStatus, nextRun time.Time) error {
 	if s == nil {
 		return ErrResultNotFound
 	}
@@ -614,6 +795,9 @@ func (s *ResultStore) setTaskStatus(taskID string, status TaskStatus) error {
 		return ErrTaskDeleted
 	}
 	s.state.Tasks[idx].Status = status
+	if !nextRun.IsZero() {
+		s.state.Tasks[idx].NextRunAt = nextRun.UTC()
+	}
 	s.state.Tasks[idx].UpdatedAt = time.Now().UTC()
 	return s.persistLocked()
 }

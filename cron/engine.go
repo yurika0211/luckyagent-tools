@@ -349,6 +349,24 @@ func (e *Engine) PauseJob(id string) error {
 	return nil
 }
 
+// NextRunAfterResume is the next planned time after a pause. It is computed
+// from now, so slots missed while paused are not claimed and not notified.
+func (e *Engine) NextRunAfterResume(id string, now time.Time) (time.Time, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	job, exists := e.jobs[id]
+	if !exists {
+		return time.Time{}, fmt.Errorf("job %s not found", id)
+	}
+	if job.Schedule == nil {
+		return time.Time{}, fmt.Errorf("job %s has no schedule", id)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return job.Schedule.Next(now), nil
+}
+
 // ResumeJob 恢复任务
 func (e *Engine) ResumeJob(id string) error {
 	e.mu.Lock()

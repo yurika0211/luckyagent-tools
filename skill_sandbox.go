@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"sync"
 	"time"
 )
@@ -66,6 +67,7 @@ type SkillSandbox struct {
 	config   SandboxConfig
 	auditLog []AuditEntry
 	registry *Registry
+	procs    map[int]*exec.Cmd
 }
 
 // NewSkillSandbox creates a new skill execution sandbox.
@@ -309,8 +311,10 @@ func (sb *SkillSandbox) ExecuteWithContext(ctx context.Context, toolName string,
 	select {
 	case o = <-done:
 	case <-ctx.Done():
+		sb.stopTracked()
 		return "", &SandboxError{ToolName: toolName, Timeout: true, Message: "context cancelled"}
 	case <-time.After(timeout):
+		sb.stopTracked()
 		return "", &SandboxError{ToolName: toolName, Timeout: true, Message: "execution timed out"}
 	}
 
@@ -350,6 +354,45 @@ func (sb *SkillSandbox) ExecuteWithContext(ctx context.Context, toolName string,
 	}
 
 	return result, o.err
+}
+
+// Track records a child process started by the current skill tool. Cancel
+// stops every tracked process before ExecuteWithContext returns.
+func (sb *SkillSandbox) Track(cmd *exec.Cmd) {
+	if sb == nil || cmd == nil || cmd.Process == nil {
+		return
+	}
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if sb.procs == nil {
+		sb.procs = map[int]*exec.Cmd{}
+	}
+	sb.procs[cmd.Process.Pid] = cmd
+}
+
+func (sb *SkillSandbox) stopTracked() {
+	if sb == nil {
+		return
+	}
+	sb.mu.Lock()
+	procs := sb.procs
+	sb.procs = nil
+	sb.mu.Unlock()
+	for _, cmd := range procs {
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		_ = cmd.Process.Kill()
+		done := make(chan struct{})
+		go func(c *exec.Cmd) {
+			_, _ = c.Process.Wait()
+			close(done)
+		}(cmd)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // truncateArgs truncates argument values for audit storage.

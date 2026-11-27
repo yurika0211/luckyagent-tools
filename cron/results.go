@@ -622,6 +622,120 @@ func (s *ResultStore) Ack(deliveryID, deviceID string, at time.Time) (Delivery, 
 	return delivery, s.persistLocked()
 }
 
+// FCMPush is one data message. Acceptance by the transport is not delivery.
+// The client still has to submit the system notification and ACK.
+type FCMPush struct {
+	DeviceID    string
+	Token       string
+	TaskID      string
+	ExecutionID string
+	DeliveryID  string
+	Summary     string
+}
+
+// FCMSender accepts a data message. A nil sender means no transport is
+// configured. The store never treats a successful send as delivered.
+type FCMSender interface {
+	Send(FCMPush) error
+}
+
+// DispatchAndroidFCM sends the data message for one Android delivery to every
+// registered device that has a token and can notify. It runs only after the
+// result transaction has committed, so the caller invokes it after Complete
+// returns. No registered device leaves the row pending and sends nothing.
+// A blocked row is not pushed. One device ACK already stopped retries.
+// A transport error marks the row retrying. It does not change the Execution.
+func (s *ResultStore) DispatchAndroidFCM(executionID string, sender FCMSender, at time.Time) ([]FCMPush, error) {
+	if s == nil || strings.TrimSpace(executionID) == "" {
+		return nil, ErrInvalidResult
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	execution, ok := s.executionLocked(strings.TrimSpace(executionID))
+	if !ok {
+		return nil, ErrResultNotFound
+	}
+	if execution.Status == ExecutionRunning {
+		return nil, ErrInvalidResult
+	}
+	idx := -1
+	for i, delivery := range s.state.Deliveries {
+		if delivery.ExecutionID == execution.ID && delivery.Channel == "android" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, nil
+	}
+	delivery := s.state.Deliveries[idx]
+	switch delivery.Status {
+	case DeliveryDelivered, DeliveryCancelled, DeliveryBlocked:
+		return nil, nil
+	case DeliveryPending, DeliveryRetrying:
+	default:
+		return nil, nil
+	}
+	if channelBlockedLocked(s.state.Devices, "android") {
+		return nil, nil
+	}
+	task, _ := s.taskLocked(execution.TaskID)
+	summary := execution.Result
+	if execution.Status == ExecutionFailed && execution.Error != "" {
+		summary = execution.Error
+	}
+	pushes := make([]FCMPush, 0)
+	for _, device := range s.state.Devices {
+		if device.Channel != "android" || strings.TrimSpace(device.FCMToken) == "" {
+			continue
+		}
+		if device.CapabilityKnown && !deviceCanNotify(device) {
+			continue
+		}
+		pushes = append(pushes, FCMPush{
+			DeviceID:    device.ID,
+			Token:       device.FCMToken,
+			TaskID:      task.ID,
+			ExecutionID: execution.ID,
+			DeliveryID:  delivery.ID,
+			Summary:     summary,
+		})
+	}
+	if len(pushes) == 0 {
+		return nil, nil
+	}
+	if sender == nil {
+		return nil, errors.New("fcm sender is not configured")
+	}
+	var sendErr error
+	sent := make([]FCMPush, 0, len(pushes))
+	for _, push := range pushes {
+		if err := sender.Send(push); err != nil {
+			sendErr = err
+			continue
+		}
+		sent = append(sent, push)
+	}
+	if sendErr != nil {
+		delivery.Status = DeliveryRetrying
+		delivery.Attempts++
+		delivery.LastError = sendErr.Error()
+		delivery.UpdatedAt = at.UTC()
+		s.state.Deliveries[idx] = delivery
+		if err := s.persistLocked(); err != nil {
+			return sent, err
+		}
+		return sent, sendErr
+	}
+	delivery.LastError = ""
+	delivery.UpdatedAt = at.UTC()
+	s.state.Deliveries[idx] = delivery
+	return sent, s.persistLocked()
+}
+
 func executionAfterCursor(execution Execution, device Device) bool {
 	if execution.ScheduledAt.After(device.CursorAt) {
 		return true

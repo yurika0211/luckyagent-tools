@@ -3,6 +3,7 @@ package cron
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -298,5 +299,107 @@ func TestResultStoreBlockedOnlyWhenEveryDeviceReportsUnavailable(t *testing.T) {
 	}
 	if got := s.ListDeliveries(none.ID)[0].Status; got != DeliveryDelivered {
 		t.Fatalf("later capability changed delivered: %s", got)
+	}
+}
+
+type recordingFCM struct {
+	fail string
+	got  []FCMPush
+}
+
+func (r *recordingFCM) Send(push FCMPush) error {
+	if r.fail != "" {
+		return errors.New(r.fail)
+	}
+	r.got = append(r.got, push)
+	return nil
+}
+
+func TestDispatchAndroidFCMAfterCommitOnly(t *testing.T) {
+	s := NewMemoryResultStore()
+	if _, err := s.EnsureTask(Task{ID: "task-1", Name: "日报", Channels: []string{"android"}}); err != nil {
+		t.Fatal(err)
+	}
+	scheduled := time.Date(2026, 11, 27, 9, 0, 0, 0, time.UTC)
+	execution, claimed, err := s.Claim("task-1", scheduled, scheduled)
+	if err != nil || !claimed {
+		t.Fatal(err)
+	}
+	sender := &recordingFCM{}
+	if pushes, err := s.DispatchAndroidFCM(execution.ID, sender, scheduled); err == nil || pushes != nil {
+		t.Fatalf("running execution dispatched %#v, %v", pushes, err)
+	}
+
+	if _, err := s.RegisterDevice(Device{ID: "phone", Channel: "android", FCMToken: "token-a", CapabilityKnown: true, NotificationsEnabled: true, ChannelEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterDevice(Device{ID: "tablet", Channel: "android", FCMToken: "token-b", CapabilityKnown: true, NotificationsEnabled: true, ChannelEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterDevice(Device{ID: "muted", Channel: "android", FCMToken: "token-c", CapabilityKnown: true, NotificationsEnabled: false, ChannelEnabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := s.Complete(execution.ID, "done", nil, scheduled.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushes, err := s.DispatchAndroidFCM(finished.ID, sender, scheduled.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pushes) != 2 || len(sender.got) != 2 {
+		t.Fatalf("pushes=%#v", pushes)
+	}
+	if sender.got[0].TaskID != "task-1" || sender.got[0].ExecutionID != finished.ID || sender.got[0].DeliveryID == "" || sender.got[0].Summary != "done" {
+		t.Fatalf("payload=%#v", sender.got[0])
+	}
+	if got := s.ListDeliveries(finished.ID)[0].Status; got != DeliveryPending {
+		t.Fatalf("accepted transport became %s", got)
+	}
+
+	if _, err := s.Ack(s.ListDeliveries(finished.ID)[0].ID, "phone", scheduled.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	sender.got = nil
+	again, err := s.DispatchAndroidFCM(finished.ID, sender, scheduled.Add(3*time.Minute))
+	if err != nil || len(again) != 0 || len(sender.got) != 0 {
+		t.Fatalf("retry after ack = %#v, %v", again, err)
+	}
+
+	other, claimed, err := s.Claim("task-1", scheduled.Add(time.Hour), scheduled.Add(time.Hour))
+	if err != nil || !claimed {
+		t.Fatal(err)
+	}
+	if _, err := s.Complete(other.ID, "", errors.New("boom"), scheduled.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	failing := &recordingFCM{fail: "upstream"}
+	if _, err := s.DispatchAndroidFCM(other.ID, failing, scheduled.Add(time.Hour)); err == nil || !strings.Contains(err.Error(), "upstream") {
+		t.Fatalf("transport error = %v", err)
+	}
+	failedDelivery := s.ListDeliveries(other.ID)[0]
+	if failedDelivery.Status != DeliveryRetrying || failedDelivery.Attempts != 1 {
+		t.Fatalf("retry state = %#v", failedDelivery)
+	}
+	if got, _ := s.GetExecution(other.ID); got.Status != ExecutionFailed || got.Error != "boom" {
+		t.Fatalf("execution changed by push: %#v", got)
+	}
+
+	empty := NewMemoryResultStore()
+	if _, err := empty.EnsureTask(Task{ID: "task-1", Channels: []string{"android"}}); err != nil {
+		t.Fatal(err)
+	}
+	lonely, claimed, err := empty.Claim("task-1", scheduled, scheduled)
+	if err != nil || !claimed {
+		t.Fatal(err)
+	}
+	if _, err := empty.Complete(lonely.ID, "quiet", nil, scheduled); err != nil {
+		t.Fatal(err)
+	}
+	if pushes, err := empty.DispatchAndroidFCM(lonely.ID, sender, scheduled); err != nil || len(pushes) != 0 {
+		t.Fatalf("no device = %#v, %v", pushes, err)
+	}
+	if got := empty.ListDeliveries(lonely.ID)[0].Status; got != DeliveryPending {
+		t.Fatalf("no device status = %s", got)
 	}
 }

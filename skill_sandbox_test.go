@@ -400,6 +400,10 @@ func TestSandboxExecuteWithContext(t *testing.T) {
 
 func TestCancelStopsTrackedSkillProcessAndLeavesTheOtherSandbox(t *testing.T) {
 	reg := NewRegistry()
+	a := NewSkillSandbox(reg, DefaultSandboxConfig())
+	b := NewSkillSandbox(NewRegistry(), DefaultSandboxConfig())
+	release := make(chan struct{})
+	tracked := make(chan [2]*exec.Cmd, 1)
 	reg.Register(&Tool{
 		Name:       "holds_child",
 		Category:   CatSkill,
@@ -407,32 +411,47 @@ func TestCancelStopsTrackedSkillProcessAndLeavesTheOtherSandbox(t *testing.T) {
 		Permission: PermAuto,
 		Enabled:    true,
 		Handler: func(map[string]any) (string, error) {
-			time.Sleep(30 * time.Second)
-			return "done", nil
+			cmdA := exec.Command("sleep", "30")
+			cmdB := exec.Command("sleep", "30")
+			if err := cmdA.Start(); err != nil {
+				return "", err
+			}
+			if err := cmdB.Start(); err != nil {
+				_ = cmdA.Process.Kill()
+				return "", err
+			}
+			a.Track(cmdA)
+			b.Track(cmdB)
+			tracked <- [2]*exec.Cmd{cmdA, cmdB}
+			<-release
+			err := cmdA.Wait()
+			if cmdB.Process != nil {
+				_ = cmdB.Process.Kill()
+			}
+			return "done", err
 		},
 	})
-	a := NewSkillSandbox(reg, DefaultSandboxConfig())
-	b := NewSkillSandbox(NewRegistry(), DefaultSandboxConfig())
-	cmdA := exec.Command("sleep", "30")
-	cmdB := exec.Command("sleep", "30")
-	if err := cmdA.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if err := cmdB.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = cmdB.Process.Kill() }()
-	a.Track(cmdA)
-	b.Track(cmdB)
+	defer close(release)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	finished := make(chan error, 1)
 	go func() {
 		_, err := a.ExecuteWithContext(ctx, "holds_child", nil)
 		finished <- err
 	}()
-	// Let ExecuteWithContext enter its select before the cancel.
-	time.Sleep(50 * time.Millisecond)
+	var children [2]*exec.Cmd
+	select {
+	case children = <-tracked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler did not track both children before cancel")
+	}
+	cmdA, cmdB := children[0], children[1]
+	defer func() {
+		if cmdB.Process != nil {
+			_ = cmdB.Process.Kill()
+		}
+	}()
 	cancel()
 
 	select {

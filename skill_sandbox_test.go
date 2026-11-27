@@ -399,7 +399,19 @@ func TestSandboxExecuteWithContext(t *testing.T) {
 }
 
 func TestCancelStopsTrackedSkillProcessAndLeavesTheOtherSandbox(t *testing.T) {
-	a := NewSkillSandbox(NewRegistry(), DefaultSandboxConfig())
+	reg := NewRegistry()
+	reg.Register(&Tool{
+		Name:       "holds_child",
+		Category:   CatSkill,
+		Source:     "test",
+		Permission: PermAuto,
+		Enabled:    true,
+		Handler: func(map[string]any) (string, error) {
+			time.Sleep(30 * time.Second)
+			return "done", nil
+		},
+	})
+	a := NewSkillSandbox(reg, DefaultSandboxConfig())
 	b := NewSkillSandbox(NewRegistry(), DefaultSandboxConfig())
 	cmdA := exec.Command("sleep", "30")
 	cmdB := exec.Command("sleep", "30")
@@ -413,17 +425,30 @@ func TestCancelStopsTrackedSkillProcessAndLeavesTheOtherSandbox(t *testing.T) {
 	a.Track(cmdA)
 	b.Track(cmdB)
 
-	a.stopTracked()
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		_, err := a.ExecuteWithContext(ctx, "holds_child", nil)
+		finished <- err
+	}()
+	// Let ExecuteWithContext enter its select before the cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
 
+	select {
+	case err := <-finished:
+		if err == nil {
+			t.Fatal("cancelling sandbox A returned success")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ExecuteWithContext did not return after cancel")
+	}
 	exited := make(chan error, 1)
 	go func() { exited <- cmdA.Wait() }()
 	select {
 	case <-exited:
 	case <-time.After(3 * time.Second):
 		t.Fatal("sandbox A left its tracked process running")
-	}
-	if cmdB.Process == nil {
-		t.Fatal("sandbox B lost its process")
 	}
 	alive := make(chan struct{})
 	go func() {

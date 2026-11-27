@@ -42,28 +42,57 @@ func TestCancelStopsTrackedSkillProcess(t *testing.T) {
 
 func TestOtherSandboxIsNotStopped(t *testing.T) {
 	reg := NewRegistry()
-	reg.Register(&Tool{Name: "noop", Enabled: true, Handler: func(map[string]any) (string, error) { return "ok", nil }})
-	first := NewSkillSandbox(reg, DefaultSandboxConfig())
-	second := NewSkillSandbox(reg, DefaultSandboxConfig())
-	cmd := exec.Command("sleep", "30")
-	if err := cmd.Start(); err != nil {
+	reg.Register(&Tool{
+		Name: "sleep_skill", Enabled: true,
+		Handler: func(map[string]any) (string, error) { return "unused", nil },
+	})
+	first := NewSkillSandbox(reg, SandboxConfig{MaxExecutionTime: time.Minute, EnableAuditLog: false})
+	second := NewSkillSandbox(reg, SandboxConfig{MaxExecutionTime: time.Minute, EnableAuditLog: false})
+	cmdA := exec.Command("sleep", "30")
+	cmdB := exec.Command("sleep", "30")
+	if err := cmdA.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdB.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		if cmdA.Process != nil {
+			_ = cmdA.Process.Kill()
+		}
+		if cmdB.Process != nil {
+			_ = cmdB.Process.Kill()
 		}
 	})
-	second.Track(cmd)
+	first.Track(cmdA)
+	second.Track(cmdB)
+	waitA := make(chan error, 1)
+	waitB := make(chan error, 1)
+	go func() { waitA <- cmdA.Wait() }()
+	go func() { waitB <- cmdB.Wait() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := first.ExecuteWithContext(ctx, "noop", nil); err == nil {
-		t.Fatal("cancelled context returned success")
+	done := make(chan error, 1)
+	go func() {
+		_, err := first.ExecuteWithContext(ctx, "sleep_skill", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled sandbox A returned success")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("sandbox A did not return after cancel")
 	}
-	if err := cmd.Process.Signal(nil); false {
-		_ = err
+	select {
+	case <-waitA:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sandbox A's child did not exit")
 	}
-	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-		t.Fatal("stopping one sandbox stopped another sandbox's process")
+	select {
+	case <-waitB:
+		t.Fatal("stopping sandbox A stopped sandbox B's process")
+	case <-time.After(200 * time.Millisecond):
 	}
 }

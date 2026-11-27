@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"os/exec"
 	"testing"
 	"time"
 )
@@ -394,6 +395,45 @@ func TestSandboxExecuteWithContext(t *testing.T) {
 	}
 	if result != "context ok" {
 		t.Errorf("expected 'context ok', got %s", result)
+	}
+}
+
+func TestCancelStopsTrackedSkillProcessAndLeavesTheOtherSandbox(t *testing.T) {
+	a := NewSkillSandbox(NewRegistry(), DefaultSandboxConfig())
+	b := NewSkillSandbox(NewRegistry(), DefaultSandboxConfig())
+	cmdA := exec.Command("sleep", "30")
+	cmdB := exec.Command("sleep", "30")
+	if err := cmdA.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdB.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmdB.Process.Kill() }()
+	a.Track(cmdA)
+	b.Track(cmdB)
+
+	a.stopTracked()
+
+	exited := make(chan error, 1)
+	go func() { exited <- cmdA.Wait() }()
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sandbox A left its tracked process running")
+	}
+	if cmdB.Process == nil {
+		t.Fatal("sandbox B lost its process")
+	}
+	alive := make(chan struct{})
+	go func() {
+		_ = cmdB.Wait()
+		close(alive)
+	}()
+	select {
+	case <-alive:
+		t.Fatal("cancelling sandbox A stopped sandbox B")
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
